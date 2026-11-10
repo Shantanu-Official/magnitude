@@ -1,0 +1,32 @@
+// Decode output of the general routed feed-forward (M <= DECODE_ROWS): the
+// down projections (`lib/routed/down.glsl`) weighted in slot order, then
+// base + selected published in R (`lib/routed/down_sum.glsl`), in one
+// launch. The Vulkan form of `metal/routed_down.metal`. The running selection
+// lives in every lane's registers and one lane stores the channel.
+#define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
+#include "lib/routed/down.glsl"
+#include "lib/routed/down_sum.glsl"
+
+void routed_down() {
+    const uint tile = gl_WorkGroupID.x;
+    const uint64_t m = gl_WorkGroupID.y;
+    const uint hidden = uint(SEISMIC_DIM_H);
+    const uint first = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile);
+    float selected[PROJECTION_GEMV_MAX_R];
+    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
+        selected[r] = 0.0;
+    float totals[PROJECTION_GEMV_SUMS];
+    // A 32-bit counter: see `streaming/contract.hpp`.
+    for (uint k = 0u; k < uint(SEISMIC_DIM_K); ++k) {
+        routed_down_choice(m, uint64_t(k), tile, totals);
+        [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r)
+            if (r < DOWN_R)
+                selected[r] = routed_down_term(selected[r], m, uint64_t(k),
+                    element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]));
+    }
+    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
+        const uint n = first + r;
+        if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
+            routed_down_put(m, uint64_t(n), selected[r]);
+    }
+}

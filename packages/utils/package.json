@@ -1,0 +1,36 @@
+{
+  "name": "@magnitudedev/utils",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./fsm": "./src/fsm/index.ts",
+    "./windows-native": "./src/windows-native/index.ts",
+    "./process-groups": "./src/process-groups/index.ts",
+    "./process-groups/native": "./src/process-groups/exact-process.ts",
+    "./process": "./src/process/index.ts",
+    "./schema": "./src/schema/index.ts",
+    "./patch": "./src/patch/index.ts",
+    "./canonical-key": "./src/canonical-key.ts",
+    "./json-line-channel": "./src/json-line-channel.ts",
+    "./atomic-file": "./src/atomic-file.ts",
+    "./data-equivalence": "./src/data-equivalence.ts",
+    "./guarded-command": "./src/guarded-command.ts",
+    "./log-file": "./src/log-file.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "effect": "^3.21.2",
+    "fast-json-patch": "^3.1.1",
+    "@effect/platform": "^0.96.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14"
+  }
+}

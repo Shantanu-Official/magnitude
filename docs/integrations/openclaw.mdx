@@ -1,0 +1,73 @@
+---
+title: "OpenClaw"
+description: "Connect OpenClaw to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install OpenClaw](https://docs.openclaw.ai/install) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → OpenClaw** and click **Connect**.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
+
+Restart your running OpenClaw instance after changing its connection, then select a Magnitude model. The configuration is persistent; connecting does not start OpenClaw for you.
+
+## Run OpenClaw
+
+After connecting in Magnitude, start OpenClaw with:
+
+```sh
+openclaw tui
+```
+
+Then select your model inside the OpenClaw TUI:
+
+```text
+/model magnitude/MODEL_ID
+```
+
+Connections shows both commands for your selected model. Run the `/model` command inside OpenClaw, not in your shell.
+
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+
+## Configuration
+
+**Connect** writes `~/.openclaw/openclaw.json`. Location overrides: `OPENCLAW_CONFIG_PATH` and `OPENCLAW_STATE_DIR`.
+
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on OpenClaw and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
+
+`~/.openclaw/openclaw.json`:
+
+```json5
+{
+  models: {
+    providers: {
+      magnitude: {
+        baseUrl: "http://ADDRESS:10100/inference/v1",
+        apiKey: "API_KEY",
+        api: "openai-completions",
+        models: [
+          {
+            id: "MODEL_ID",
+            name: "MODEL_ID",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32768,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}
+```

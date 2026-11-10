@@ -1,0 +1,49 @@
+name: Integration checks
+
+on:
+  pull_request:
+    paths:
+      - "packages/sdk/**"
+      - "packages/acn-protocol/**"
+      - "packages/version/**"
+      - "packages/release/**"
+      - "packages/utils/**"
+      - "packages/ai/**"
+      - "packages/icn-protocol/**"
+      - "packages/openapi-effect/**"
+      - "packages/roles/**"
+      - "cli/src/harness-connections/**"
+      - "cli/src/commands/**"
+      - ".github/workflows/**"
+      - "bun.lock"
+      - "package.json"
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  integrations:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: npm install --global npm@11.6.2
+      - run: bun run --cwd packages/version typecheck
+      - run: bun run --cwd packages/version test
+      - run: bun run --cwd packages/release typecheck
+      - run: bun scripts/check-sdk-boundary.ts
+      - run: bun packages/daemon-management/scripts/build-native.ts
+      - run: bunx --bun vitest run packages/sdk packages/daemon-management packages/release packages/acn-protocol
+      # Allocate against the public GitHub release baseline; nothing is committed.
+      - run: bun packages/release/scripts/prepare-release.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: bunx --bun vitest run src/harness-connections src/commands
+        working-directory: cli

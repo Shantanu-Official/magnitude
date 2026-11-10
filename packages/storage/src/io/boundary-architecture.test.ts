@@ -1,0 +1,44 @@
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+
+const repositoryRoot = resolve(import.meta.dirname, "../../../..");
+
+const boundaryFiles = [
+  "packages/daemon-management/src/desktop-native/owned-service.ts",
+  "packages/acn/src/server.ts",
+  "packages/acn/src/session-runtime-options.ts",
+  "packages/storage/src/io/structured-file.ts",
+  "packages/acn/src/server-settings.ts",
+  "packages/acn/src/harness-connections.ts",
+] as const;
+
+describe("external-data boundary architecture", () => {
+  it("does not use throwing codecs or swallow defects", async () => {
+    for (const relativePath of boundaryFiles) {
+      const source = await readFile(
+        resolve(repositoryRoot, relativePath),
+        "utf8"
+      );
+      expect(source, relativePath).not.toMatch(
+        /Schema\.(?:decodeUnknownSync|decodeSync|validateSync)\b/
+      );
+      expect(source, relativePath).not.toMatch(/\bJSON\.parse\s*\(/);
+      expect(source, relativePath).not.toMatch(/Effect\.catchAllDefect\b/);
+    }
+  });
+
+  it("keeps the removed JSON lock protocol out of production coordination", async () => {
+    for (const relativePath of [
+      "packages/daemon-management/src/desktop-native/owned-service.ts",
+      "packages/acn/src/server.ts",
+    ]) {
+      const source = await readFile(
+        resolve(repositoryRoot, relativePath),
+        "utf8"
+      );
+      expect(source, relativePath).not.toContain("registry.lock");
+      expect(source, relativePath).not.toContain("owner.json");
+    }
+  });
+});

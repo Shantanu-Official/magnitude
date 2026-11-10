@@ -1,0 +1,141 @@
+import type {
+  LocalInferenceHardware,
+  CustomModelAcquisitionState,
+  MemoryShortage,
+  ModelInstanceAllocation,
+  ModelInstanceFailure,
+  ModelLoadDevice,
+  ModelLoadPlan,
+  ModelLoadStage,
+  ModelOptimizationProgress,
+  ModelResidency,
+} from "@magnitudedev/sdk"
+import { Option } from "effect"
+import { formatMemorySize } from "./format-bytes"
+
+export const MEMORY_SHORTAGE_TITLE = "Not enough memory right now"
+
+export const MEMORY_PRESSURE_TITLE = "Your computer is under heavy memory pressure"
+
+/** A memory shortage's headline: a blocked load lacks memory, a load under pressure met a system that was struggling. */
+export const memoryShortageTitle = (shortage: MemoryShortage): string =>
+  shortage._tag === "Blocked" ? MEMORY_SHORTAGE_TITLE : MEMORY_PRESSURE_TITLE
+
+/** What a memory shortage means for the user and what they can do about it. */
+export const describeMemoryShortage = (shortage: MemoryShortage): string => {
+  switch (shortage._tag) {
+    case "Blocked":
+      return `This model needs ${formatMemorySize(shortage.requiredBytes, { rounding: "up" })} and ${formatMemorySize(shortage.availableBytes)} is available. Quit apps you aren’t using, or choose a smaller model.`
+    case "UnderPressure":
+      return "Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment."
+  }
+}
+
+/** A load failure in the user's terms: a shortage is described, anything else is the service's message. */
+export const describeModelLoadFailure = (failure: ModelInstanceFailure): string =>
+  "_tag" in failure
+    ? `${memoryShortageTitle(failure.shortage)}. ${describeMemoryShortage(failure.shortage)}`
+    : failure.message
+
+/** Whether the model was loaded and the machine running low on memory stopped it. */
+export const modelStoppedForMemory = (residency: ModelResidency): boolean =>
+  residency._tag === "Stopped" && residency.reason === "memory_pressure"
+
+export const MODEL_STOPPED_FOR_MEMORY_MESSAGE =
+  "Stopped because your computer ran low on memory"
+
+/** One word for a load stage, where space is short (the tray, the CLI). */
+export const formatModelLoadStage = (stage: ModelLoadStage): string => {
+  switch (stage) {
+    case "queued": return "Waiting"
+    case "preparing": return "Preparing"
+    case "optimizing": return "Optimizing"
+    case "loading_weights": return "Loading"
+    case "finalizing": return "Finalizing"
+  }
+}
+
+/**
+ * A load stage in full, naming the accelerator tuning is for when the hardware snapshot has it.
+ * A CPU load has no accelerator.
+ */
+export const describeModelLoadStage = (
+  stage: ModelLoadStage,
+  plannedAllocation: Option.Option<ModelLoadPlan>,
+  hardware: Option.Option<LocalInferenceHardware>,
+): string => {
+  switch (stage) {
+    case "queued": return "Waiting for memory…"
+    case "preparing": return "Preparing…"
+    case "optimizing": return describeOptimizing(Option.map(plannedAllocation, (plan) => plan.device), hardware)
+    case "loading_weights": return "Loading weights…"
+    case "finalizing": return "Finalizing…"
+  }
+}
+
+const describeOptimizing = (
+  device: Option.Option<ModelLoadDevice>,
+  hardware: Option.Option<LocalInferenceHardware>,
+): string => Option.match(
+  Option.flatMap(device, (selected) => Option.flatMap(hardware, (snapshot) =>
+    Option.fromNullable(snapshot.accelerators.find((accelerator) =>
+      accelerator.executors.some(executor => executor.deviceId === selected.deviceId))))),
+  {
+    onNone: () => "Optimizing…",
+    onSome: (accelerator) => `Optimizing for ${accelerator.name}…`,
+  },
+)
+
+/** Tuning's share done, or none while preparation is still counting the work. */
+export const modelOptimizationFraction = (progress: ModelOptimizationProgress): Option.Option<number> =>
+  progress.stage === "tuning" && progress.total > 0
+    ? Option.some(Math.min(1, progress.completed / progress.total))
+    : Option.none()
+
+/** Post-download optimization in full, naming the accelerator it tunes for when known. */
+export const describeModelOptimization = (
+  progress: ModelOptimizationProgress,
+  hardware: Option.Option<LocalInferenceHardware>,
+): string => progress.stage === "preparing"
+  ? "Preparing to optimize…"
+  : describeOptimizing(progress.device, hardware)
+
+/** Post-download optimization that has not finished and waits for the device a loaded model holds. */
+export const MODEL_OPTIMIZATION_PENDING = "Optimization pending"
+
+export const MODEL_OPTIMIZATION_PENDING_DETAIL = "One-time setup for this device runs when no model is loaded."
+
+/** Whether a model's optimization is pending while nothing of the model itself runs: a running model shows its own state. */
+export const modelOptimizationPendingIdle = (acquisition: CustomModelAcquisitionState): boolean =>
+  acquisition._tag === "OptimizationPending" && !modelResidencyActive(acquisition.residencyState)
+
+/** Whether a model is requested, loading, ready or stopping. */
+export const modelResidencyActive = (residency: ModelResidency): boolean =>
+  residency._tag === "Requested" || residency._tag === "Loading" || residency._tag === "Ready" || residency._tag === "Stopping"
+
+/** Post-download optimization where space is short (the CLI). */
+export const formatModelOptimization = (progress: ModelOptimizationProgress): string => Option.match(
+  modelOptimizationFraction(progress),
+  {
+    onNone: () => "Optimizing",
+    onSome: (fraction) => `Optimizing ${formatModelLoadPercentage(fraction)}`,
+  },
+)
+
+/** Whether a stage's fraction measures its work; the others have no progress of their own. */
+export const isMeasuredModelLoadStage = (stage: ModelLoadStage): boolean =>
+  stage === "optimizing" || stage === "loading_weights"
+
+/** Whole percent done; the tolerance keeps an exact share such as 232 / 400 from reading one low. */
+export const formatModelLoadPercentage = (fraction: number): string =>
+  `${Math.floor(fraction * 100 + 1e-9)}%`
+
+/** Memory a ready model holds across every memory domain. */
+export const modelMemoryBytes = (allocation: ModelInstanceAllocation): number =>
+  allocation.memoryDomains.reduce(
+    (total, domain) => total + domain.modelBytes + domain.contextBytes + domain.computeBytes + domain.auxiliaryBytes,
+    0,
+  )
+
+export const formatModelMemory = (allocation: ModelInstanceAllocation): string =>
+  formatMemorySize(modelMemoryBytes(allocation))

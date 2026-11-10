@@ -1,0 +1,109 @@
+import assert from 'node:assert/strict';
+import {join} from 'node:path';
+import {mkdtemp,rm,readFile,writeFile,stat} from 'node:fs/promises';
+import {spawn,execFileSync} from 'node:child_process';
+import {createConnection} from 'node:net';
+import {setTimeout as delay} from 'node:timers/promises';
+import {_electron as electron} from 'playwright';
+assert.equal(process.platform,'linux');
+assert.equal(process.versions.bun,undefined,'Playwright Electron acceptance requires Node, not the Bun node shim');
+const executablePath='/usr/bin/magnitude-desktop';
+const cliExecutable=process.env.MAGNITUDE_TEST_CLI_EXECUTABLE;
+assert.ok(cliExecutable,'MAGNITUDE_TEST_CLI_EXECUTABLE must name the compiled CLI');
+const assembled=process.env.MAGNITUDE_TEST_ASSEMBLED_DESKTOP;
+if(assembled){
+ for(const file of ['magnitude','resources/magnitude-service','resources/desktop-host.node','resources/magnitude-command','resources/app.asar','resources/application-icon.png','resources/trayTemplate@2x.png','resources/Magnitude-LICENSE.txt','chrome-sandbox','LICENSES.chromium.html']){
+   assert.deepEqual(await readFile(join('/usr/lib/magnitude-desktop',file)),await readFile(join(assembled,file)),`Installed payload changed: ${file}`);
+ }
+ assert.deepEqual(await readFile('/usr/share/doc/magnitude-desktop/copyright'),await readFile(join(assembled,'LICENSE')));
+ const sandbox=await stat('/usr/lib/magnitude-desktop/chrome-sandbox');
+ assert.equal(sandbox.uid,0);assert.equal(sandbox.gid,0);assert.equal(sandbox.mode & 0o7777,0o4755);
+ console.log('PASS installed executables, renderer, icons and licenses match the assembled app; sandbox permissions are correct');
+}
+const root=await mkdtemp('/tmp/mag-login-');
+const inferenceInstallation=process.env.MAGNITUDE_TEST_INFERENCE_INSTALLATION;
+const env={...process.env,HOME:root,XDG_CONFIG_HOME:join(root,'config'),MAGNITUDE_ICN_PATH:inferenceInstallation??join(root,'absent-engine.json'),MAGNITUDE_SHELL_ENV_INHERITED:'1'};
+delete env.MAGNITUDE_DESKTOP_PATH;
+delete env.MAGNITUDE_DEV_DATA_DIR;delete env.MAGNITUDE_DEV_PORT;delete env.MAGNITUDE_DESKTOP_STATE_DIR;
+const endpoint=join(root,'.magnitude/state/application.sock');
+const entry=join(env.XDG_CONFIG_HOME,'autostart/dev.magnitude.desktop');
+const until=async(fn)=>{const deadline=Date.now()+60000;do{if(await fn())return;await delay(100)}while(Date.now()<deadline);throw Error('condition timed out after 60 seconds')};
+const request=intent=>new Promise((resolve,reject)=>{
+ const socket=createConnection(endpoint);let data='';
+ socket.setTimeout(5000,()=>socket.destroy(Error('Control timeout')));
+ socket.on('error',reject);
+ socket.on('connect',()=>socket.write(JSON.stringify(typeof intent === 'string' ? {version:1,intent} : {version:1,...intent})+'\n'));
+ socket.on('data',chunk=>{data+=chunk;if(data.includes('\n')){socket.destroy();try{resolve(JSON.parse(data.split('\n')[0]))}catch(e){reject(e)}}});
+});
+let app;let coldOwner;
+const wm=spawn('xfwm4',['--compositor=off'],{env,stdio:'inherit'});
+try {
+ app=await electron.launch({chromiumSandbox:true,executablePath,env,timeout:45000});
+ await until(async()=>{try{return (await request({login:'read'})).state._tag==='Disabled'}catch{return false}});
+ assert.equal((await request({login:'enable'})).state._tag,'Enabled');
+ const enabled=await readFile(entry,'utf8');
+ assert.match(enabled,/--background/);assert.match(enabled,/Hidden=false/);
+ execFileSync('desktop-file-validate',[entry]);
+ assert.equal((await request({login:'disable'})).state._tag,'Disabled');
+ assert.match(await readFile(entry,'utf8'),/Hidden=true/);
+ assert.equal((await request({login:'enable'})).state._tag,'Enabled');
+ await writeFile(entry,enabled.replace('Hidden=false','Hidden=true'));
+ await until(async()=>(await request({login:'read'})).state._tag==='Disabled');
+ console.log('PASS application control enables/disables real XDG login entry and observes external disable');
+ assert.equal((await request({login:'enable'})).state._tag,'Enabled');
+ await request('Quit');
+ await app.waitForEvent('close',{timeout:30000});app=undefined;
+ execFileSync('gio',['launch',entry],{env,stdio:'inherit'});
+ await until(async()=>{try{coldOwner=(await request('Observe')).pid;return true}catch{return false}});
+ const windows=execFileSync('xprop',['-root','_NET_CLIENT_LIST'],{env,encoding:'utf8'}).match(/0x[0-9a-f]+/g)??[];
+ for(const id of windows){const pid=execFileSync('xprop',['-id',id,'_NET_WM_PID'],{env,encoding:'utf8'});assert.notEqual(Number(pid.match(/= (\d+)/)?.[1]),coldOwner,'autostart must not map a window')}
+ console.log('PASS real GLib desktop-entry cold launch starts owner without a visible window');
+ await request('Quit');
+ await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
+ console.log('PASS login-started owner accepts full Quit');
+ const cli=args=>execFileSync(cliExecutable,args,{env,encoding:'utf8',timeout:45000});
+ assert.match(cli(['app','open']),/opened/i);
+ coldOwner=(await request('Observe')).pid;
+ assert.match(await readFile(entry,'utf8'),/Hidden=false/);
+ if(inferenceInstallation)await until(()=>/Runtime\s+Ready/.test(cli(['status'])));
+ const status=cli(['status']);
+ assert.match(status,inferenceInstallation?/Runtime\s+Ready/:/Runtime\s+(Starting|Failed)/);
+ if(inferenceInstallation)console.log('PASS installed desktop owns a Ready service with the supplied inference installation');
+ assert.match(status,/Starts at login\s+Yes/);
+ await request('Quit');
+ await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
+ assert.match(await readFile(entry,'utf8'),/Hidden=false/);
+ cli(['app','open']);
+ coldOwner=(await request('Observe')).pid;
+ assert.equal((await request({login:'disable'})).state._tag,'Disabled');
+ await request('Quit');
+ await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
+ assert.match(await readFile(entry,'utf8'),/Hidden=true/);
+ assert.match(cli(['status']),/Runtime\s+Stopped/);
+ console.log('PASS compiled Linux CLI app open/status observes Desktop; Quit preserves login and explicit login disable persists');
+ app=await electron.launch({chromiumSandbox:true,executablePath,args:['--background'],env,timeout:45000});
+ const shutdownProcess=app.process();
+ const shutdownClosed=app.waitForEvent('close',{timeout:30000});
+ await app.evaluate(({powerMonitor})=>powerMonitor.emit('shutdown',{preventDefault(){throw Error('System shutdown must not be vetoed')}}));
+ await shutdownClosed;app=undefined;
+ assert.equal(shutdownProcess.exitCode,0);
+ assert.match(cli(['status']),/Runtime\s+Stopped/);
+ console.log('PASS simulated Linux powerMonitor shutdown: no veto, exit0, owner stopped; not an OS logout test');
+
+ {
+   execFileSync('gio',['launch','/usr/share/applications/magnitude-desktop.desktop'],{env,stdio:'inherit'});
+   await until(async()=>{try{coldOwner=(await request('Observe')).pid;return true}catch{return false}});
+   await until(()=>{
+     const ids=execFileSync('xprop',['-root','_NET_CLIENT_LIST'],{env,encoding:'utf8'}).match(/0x[0-9a-f]+/g)??[];
+     return ids.some(id=>Number(execFileSync('xprop',['-id',id,'_NET_WM_PID'],{env,encoding:'utf8'}).match(/= (\d+)/)?.[1])===coldOwner);
+   });
+   await request('Quit');
+   await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}});coldOwner=undefined;
+   console.log('PASS installed application-menu entry visibly opens the same owner; default CLI launch needs no path override');
+ }
+} finally {
+ if(app)await app.close();
+ if(coldOwner){await request('Quit').catch(()=>{});await until(()=>{try{process.kill(coldOwner,0);return false}catch(e){if(e.code==='ESRCH')return true;throw e}})}
+ wm.kill('SIGTERM');
+ await rm(root,{recursive:true,force:true});
+}

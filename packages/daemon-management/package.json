@@ -1,0 +1,31 @@
+{
+  "name": "@magnitudedev/daemon-management",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./bun": "./src/bun.ts",
+    "./desktop-native": "./src/desktop-native/exports.ts",
+    "./private-files": "./src/desktop-native/private-files.ts",
+    "./application-update": "./src/application-update/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.0",
+    "@magnitudedev/acn-protocol": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/storage": "workspace:*",
+    "@magnitudedev/sdk": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "dbus-native": "0.15.2",
+    "effect": "3.21.2"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "^0.90.0",
+    "@types/node": "^24",
+    "node-api-headers": "1.9.0",
+    "vitest": "^3.2.4"
+  }
+}

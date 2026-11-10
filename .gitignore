@@ -1,0 +1,34 @@
+node_modules
+# Per-agent Cargo target directories and scratch source mirrors.
+**/.agent-targets/
+.turbo
+dist
+/bin
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+release-artifacts
+/jobs
+packages/agent/tmp
+*.tsbuildinfo
+notes
+.motel-data
+specs
+sessions
+bugs
+handoffs
+campaigns
+
+# Web / Desktop
+web/dist
+web/node_modules
+desktop/out
+desktop/node_modules
+
+packages/launcher/bin/magnitude.js
+# Generated from packages/release/release-plan.json by packages/version/scripts/generate-version.ts
+packages/acn-protocol/src/rpc-version.ts
+
+.humanlayer/tasks/

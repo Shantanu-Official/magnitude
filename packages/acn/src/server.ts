@@ -1,0 +1,973 @@
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
+import { ChatInferenceLive } from "./chat/inference"
+import { ChatServiceLive } from "./chat/service"
+import { ChatModelDefaultsStoreLive } from "./chat/model-defaults"
+import {
+  BunHttpServer,
+  BunFileSystem,
+  BunPath,
+  BunCommandExecutor,
+} from "@effect/platform-bun"
+import { FetchHttpClient, FileSystem, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
+import { join } from "node:path"
+import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
+import * as HttpServer from "@effect/platform/HttpServer"
+import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
+import { RpcSerialization, RpcServer } from "@effect/rpc"
+import {
+  Console,
+  Context,
+  Cause,
+  Data,
+  Deferred,
+  Duration,
+  Effect,
+  Either,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Runtime,
+  Schema,
+  Scope,
+  Stream,
+} from "effect"
+import {
+  ChatStoreLive,
+  StorageLive,
+  GlobalStorage,
+  MagnitudeStorage,
+  makeGlobalStorage,
+  ProjectStorageLiveFromCwd,
+  VersionLive,
+  MagnitudeConfigSchema,
+  readStructuredFile,
+  resolveNetworkAccess,
+  generateApiKey,
+  makeConfigStorage,
+  admitsRequestHost,
+  authorizesRemoteInference,
+  LOOPBACK_ONLY,
+  ALL_INTERFACES_BIND,
+  type NetworkAccess,
+  type NetworkAccessConfig,
+} from "@magnitudedev/storage"
+import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
+import {
+  MagnitudeHealthResponseSchema,
+  AcnRpcGroup, } from "@magnitudedev/acn-protocol"
+import { IcnHardware, IcnInstances, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
+import { AcnBoundaryLive } from "./boundary/acn"
+import { defaultDataDir } from "./data-dir"
+import { AgentFactoryLive } from "./agent-factory"
+import { AgentRuntimeLive } from "./agent-runtime"
+import { ProviderModelCatalogLive } from "./provider-model-catalog"
+import { ProviderCredentialsLive } from "./provider-credentials"
+import { ModelSlotControllerLive } from "./model-slot-controller"
+import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
+import { ServingUsage, ServingUsageLive } from "./serving-usage"
+import { InferenceActivity, InferenceActivityLive, finishWithBody, type InferenceActivityApi } from "./inference-activity"
+import { makeUsageFetch, makeUsageWebSocket } from "./serving-usage-observer"
+import type { InferenceFetch } from "./inference-gateway"
+import {
+  ProviderClientRegistryLive,
+  SharedProviderClientLive,
+} from "./shared-client"
+import { ActiveSessionStatusesLive } from "./active-session-statuses"
+import { DisplayViewStreamsLive } from "./display-view-streams"
+import {
+  AcnDisplayViewIntrospectorLive,
+  AcnIntrospectorLive,
+  AcnIntrospector,
+  installAcnIntrospectionRoutes,
+  type AcnIntrospectorApi,
+} from "./introspection"
+import { SessionCommandsLive } from "./session-commands"
+import { SessionDraftsLive } from "./session-drafts"
+import { SessionLifecycleLive } from "./session-lifecycle"
+import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
+import { ModelSelectionLive } from "./model-selection"
+import { makeAcnIcn } from "./icn"
+import { LocalModelSourcesLive } from "./local-model-sources"
+import { LocalModelsLive } from "./local-models"
+import { LocalModelRemovalsLive } from "./local-model-removals"
+import { ModelCatalogLive } from "./model-catalog"
+import { ModelCommandsLive } from "./model-commands"
+import { LocalProviderOfferingsLive } from "./local-provider-offerings"
+import type { AcnOwnerControl } from "./owned-control"
+import { LocalProviderResolverLive } from "./local-provider-resolver"
+import { LocalInferenceHardwareLive } from "./local-inference-hardware"
+import { CustomEndpointsLive } from "./custom-endpoints"
+import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
+import { CustomModelsLive } from "./custom-models"
+import { CustomModelReconcilerLive } from "./custom-model-reconciler"
+import { HuggingFaceAccountLive, HuggingFaceOAuthConfigLive } from "./hugging-face-account"
+import { CustomModelCommandsLive } from "./custom-model-commands"
+import { CatalogModelSyncLive } from "./catalog-model-sync"
+import { ModelLocationsLive } from "./model-locations"
+import { FileMentionSearcherLive } from "./file-mention-searcher"
+import { FileSystemManagerLive } from "./file-system-manager"
+import { GitInspectorLive } from "./git-inspector"
+import { ProjectFileManagerLive } from "./project-file-manager"
+import { ProjectInspectorLive } from "./project-inspector"
+import { ProjectManagerLive } from "./project-manager"
+import { ProjectStoreLive } from "./project-store"
+import { SessionInspectorLive } from "./session-inspector"
+import { ACN_VERSION } from "./version"
+import { TracingLayer } from "./tracing"
+import {
+  ACN_INSTANCE_ID,
+  makeHealthResponse,
+} from "./identity"
+import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
+import { containerNetworkConfig, readContainerInstallation, type ContainerInstallation } from "./container"
+import { AcnHarnessConnectionsLive } from "./harness-connections"
+import { AcnOwner } from "./application-owner"
+import { resolveWebAppSource, serveWebApp } from "./web-app"
+import { fileSessionStore, installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
+import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
+import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
+import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
+import {
+  AcnServiceLifecycle,
+  makeAcnServiceLifecycle,
+  type AcnServiceLifecycleApi,
+} from "./service-lifecycle"
+import {
+  type InferenceProxyTarget,
+  makeAnthropicGateway,
+  makeCodexGateway,
+  codexWebSocketTarget,
+  proxyLocalAnthropicInferenceRequest,
+  proxyOpenAiInferenceRequest,
+} from "./inference-gateway"
+
+export interface AcnServerOptions {
+  readonly debug?: boolean
+  readonly dataDir?: string
+  readonly port?: number
+}
+
+export const ACN_PUBLIC_PORT = 10_100
+
+class InferenceProxyFailed extends Data.TaggedError("InferenceProxyFailed")<{
+  readonly cause: unknown
+}> {}
+
+/** ACN stopped for a reason it has already logged; its supervisor restarts it. */
+export class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
+  readonly reason: "fatal" | "icn-exited" | "startup-failed"
+  readonly message: string
+}> {}
+
+const CORS_ALLOWED_HEADERS =
+  "Accept, Authorization, Content-Type, Content-Length, Magnitude-Include-Progress, anthropic-version, anthropic-beta, x-api-key, x-magnitude-acn-id, traceparent, tracestate, baggage, b3, x-b3-traceid, x-b3-spanid, x-b3-parentspanid, x-b3-sampled, x-b3-flags"
+const LOCAL_HTTP_ORIGIN =
+  /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/
+
+const closeApplication = (scope: Scope.CloseableScope) =>
+  Scope.close(scope, Exit.void).pipe(
+    Effect.disconnect,
+    Effect.timeoutOption(Duration.seconds(5)),
+    Effect.asVoid,
+  )
+
+const boundedShutdownStep = (
+  effect: Effect.Effect<unknown, unknown>,
+  timeout: Duration.DurationInput = Duration.seconds(5),
+) => effect.pipe(
+  Effect.disconnect,
+  Effect.timeoutOption(timeout),
+  Effect.asVoid,
+)
+
+export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => {
+  const failure = Cause.failureOption(cause)
+  if (Option.isSome(failure) && failure.value instanceof Error) {
+    const message = failure.value.message.split(/\r?\n/, 1)[0]?.trim()
+    if (message) return message.slice(0, 500)
+  }
+  return "Magnitude service could not start. See diagnostics for details."
+}
+
+/** A failed engine download says everything in its message; its stack frames would only bury it. */
+const logStartupFailure = (cause: Cause.Cause<unknown>) => Option.match(Cause.failureOption(cause), {
+  onSome: failure => failure instanceof ReleaseIcnInstallationError && failure.stage === "acquire"
+    ? Effect.logError(`ACN application startup failed: ${failure.message}`)
+    : Effect.logError("ACN application startup failed", cause),
+  onNone: () => Effect.logError("ACN application startup failed", cause),
+})
+
+const DESKTOP_APP_ORIGIN = "magnitude://app"
+
+function isAllowedCorsOrigin(origin: string): boolean {
+  return LOCAL_HTTP_ORIGIN.test(origin) || origin === DESKTOP_APP_ORIGIN
+}
+
+function corsHeadersFor(
+  request: HttpServerRequest.HttpServerRequest
+): Record<string, string> | null {
+  const origin = request.headers.origin
+  if (!origin || !isAllowedCorsOrigin(origin)) return null
+
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "access-control-allow-headers": CORS_ALLOWED_HEADERS,
+    "access-control-expose-headers": "request-id, x-request-id",
+    "access-control-max-age": "86400",
+    vary: "Origin",
+  }
+}
+
+function withCors(
+  response: HttpServerResponse.HttpServerResponse,
+  request: HttpServerRequest.HttpServerRequest
+) {
+  const headers = corsHeadersFor(request)
+  return headers ? HttpServerResponse.setHeaders(response, headers) : response
+}
+
+const disallowedCorsResponse = HttpServerResponse.empty({ status: 403 })
+const encodeHealthResponse = Schema.encode(MagnitudeHealthResponseSchema)
+
+// OPTIONS preflight handler — catches all OPTIONS requests.
+const OptionsRouteHandler = (request: HttpServerRequest.HttpServerRequest) => {
+  const headers = corsHeadersFor(request)
+  if (!headers) return Effect.succeed(disallowedCorsResponse)
+  return Effect.succeed(
+    HttpServerResponse.setHeaders(
+      HttpServerResponse.empty({ status: 204 }),
+      headers
+    )
+  )
+}
+
+const AcnProcessHandlersLive = Layer.scopedDiscard(
+  Effect.gen(function* () {
+    const lifecycle = yield* AcnServiceLifecycle
+    const runtime = yield* Effect.runtime<never>()
+
+    const uncaughtExceptionHandler = (error: Error) => {
+      Runtime.runPromise(
+        runtime,
+        Effect.gen(function* () {
+          yield* Effect.logError("Uncaught exception in ACN process").pipe(
+            Effect.annotateLogs({ error: error.stack ?? String(error) })
+          )
+          yield* lifecycle.beginStopping({
+            reason: "fatal",
+            detail: "Magnitude service encountered an unexpected error. See diagnostics for details.",
+          })
+        })
+      ).catch(() => undefined)
+    }
+
+    const unhandledRejectionHandler = (reason: unknown) => {
+      Runtime.runPromise(
+        runtime,
+        Effect.gen(function* () {
+          const message =
+            reason instanceof Error
+              ? reason.stack ?? String(reason)
+              : String(reason)
+          yield* Effect.logError(
+            "Unhandled promise rejection in ACN process"
+          ).pipe(Effect.annotateLogs({ reason: message }))
+          yield* lifecycle.beginStopping({
+            reason: "fatal",
+            detail: "Magnitude service encountered an unexpected error. See diagnostics for details.",
+          })
+        })
+      ).catch(() => undefined)
+    }
+
+    const requestSignalShutdown = (signal: NodeJS.Signals) => {
+      Runtime.runPromise(
+        runtime,
+        lifecycle.beginStopping({ reason: "signal", detail: signal })
+      ).catch(() => undefined)
+    }
+    const sigintHandler = () => requestSignalShutdown("SIGINT")
+    const sigtermHandler = () => requestSignalShutdown("SIGTERM")
+    const processEvents = process as unknown as NodeJS.EventEmitter
+
+    processEvents.on("uncaughtException", uncaughtExceptionHandler)
+    processEvents.on("unhandledRejection", unhandledRejectionHandler)
+    processEvents.on("SIGINT", sigintHandler)
+    processEvents.on("SIGTERM", sigtermHandler)
+
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        processEvents.removeListener("uncaughtException", uncaughtExceptionHandler)
+        processEvents.removeListener("unhandledRejection", unhandledRejectionHandler)
+        processEvents.removeListener("SIGINT", sigintHandler)
+        processEvents.removeListener("SIGTERM", sigtermHandler)
+      })
+    )
+  })
+)
+
+/** A handler's defect fails only its own request; it never ends the server and every other client's requests and subscriptions. */
+export const acnRpcServerOptions = { disableFatalDefects: true } as const
+
+const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
+  const storageBase = Layer.mergeAll(
+    VersionLive(ACN_VERSION),
+    ProjectStorageLiveFromCwd(process.cwd())
+  )
+
+  const storageLayer = StorageLive.pipe(Layer.provide(storageBase))
+
+  // The two durable read authorities plus host observation services. Platform
+  // requirements (FileSystem, Path, CommandExecutor) flow from infrastructure.
+  const domainCore = Layer.mergeAll(
+    FileSystemManagerLive,
+    GitInspectorLive,
+    ProjectStoreLive,
+    SessionInspectorLive,
+  ).pipe(Layer.provideMerge(storageLayer))
+
+  const storageServices = Layer.mergeAll(
+    SessionRuntimeOptionsStoreLive
+  ).pipe(Layer.provideMerge(domainCore))
+
+  const withSubscriptions = Layer.provideMerge(
+    AcnSubscriptionsLive,
+    storageServices
+  )
+  // The change registry serves `StreamChanges`; storage change streams are
+  // forwarded into it here, versioned snapshots publish their own pokes.
+  const withChanges = Layer.provideMerge(
+    AcnStorageChangesLive,
+    Layer.provideMerge(AcnChangesLive, withSubscriptions),
+  )
+  const withHuggingFace = Layer.provideMerge(
+    HuggingFaceAccountLive.pipe(Layer.provide(HuggingFaceOAuthConfigLive)),
+    withChanges,
+  )
+  const localServices = addLocalInferenceServices(
+    withHuggingFace,
+    dataDir
+  )
+  const withSharedClient = Layer.provideMerge(
+    SharedProviderClientLive,
+    localServices
+  )
+  const withCatalog = Layer.provideMerge(
+    ProviderModelCatalogLive,
+    withSharedClient
+  )
+  const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withCatalog)
+  const withInference = Layer.provideMerge(ChatInferenceLive, withUsage)
+  const withChats = Layer.provideMerge(
+    ChatServiceLive.pipe(Layer.provide(ChatStoreLive.pipe(Layer.provide(BunSqliteDriverLayer)))),
+    withInference,
+  )
+  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withChats)
+  const withCredentials = Layer.provideMerge(
+    ProviderCredentialsLive,
+    withModelCatalog
+  )
+  const withCloudUsage = Layer.provideMerge(
+    MagnitudeCloudUsageLive,
+    withCredentials
+  )
+  const withModelSlots = Layer.provideMerge(
+    ModelSlotControllerLive,
+    withCloudUsage
+  )
+  const withCustomModelReconciliation = Layer.provideMerge(CustomModelReconcilerLive, withModelSlots)
+  const withCatalogModelSync = Layer.provideMerge(CatalogModelSyncLive, withCustomModelReconciliation)
+  const withCustomModelCommands = Layer.provideMerge(CustomModelCommandsLive, withCatalogModelSync)
+  const withModelCommands = Layer.provideMerge(ModelCommandsLive, withCustomModelCommands)
+  const withCustomEndpointReconciliation = Layer.provideMerge(
+    CustomEndpointReconcilerLive,
+    withModelCommands,
+  )
+  const withFactory = Layer.provideMerge(
+    AgentFactoryLive({ debug, version: ACN_VERSION }),
+    withCustomEndpointReconciliation
+  )
+  const withRuntime = Layer.provideMerge(AgentRuntimeLive, withFactory)
+  const withDrafts = Layer.provideMerge(SessionDraftsLive, withRuntime)
+  return withDrafts
+}
+
+const addLocalInferenceServices = <A, E, R>(
+  base: Layer.Layer<A, E, R>,
+  dataDir: string
+) => {
+  const withIcn = Layer.provideMerge(makeAcnIcn(dataDir), base)
+  const withModelRemovals = Layer.provideMerge(LocalModelRemovalsLive, withIcn)
+  const withSelection = Layer.provideMerge(
+    ModelSelectionLive,
+    withModelRemovals
+  )
+  const withCustomEndpoints = Layer.provideMerge(
+    CustomEndpointsLive,
+    withSelection,
+  )
+  const withHardware = Layer.provideMerge(
+    LocalInferenceHardwareLive,
+    withCustomEndpoints
+  )
+  const withCustomModels = Layer.provideMerge(
+    Layer.mergeAll(CustomModelsLive, ModelLocationsLive),
+    withHardware,
+  )
+  const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withCustomModels)
+  const withLocalModels = Layer.provideMerge(LocalModelsLive, withCatalogAdapter)
+  const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withLocalModels)
+  const withResolver = Layer.provideMerge(
+    LocalProviderResolverLive,
+    withOfferings
+  )
+  const withIcnProvider = Layer.provideMerge(makeIcnProvider(), withResolver)
+  const withProviderClients = Layer.provideMerge(
+    ProviderClientRegistryLive,
+    withIcnProvider
+  )
+  return withProviderClients
+}
+
+const addCommonAcnServices = <A, E, R>(services: Layer.Layer<A, E, R>) => {
+  const withMentionSearcher = Layer.provideMerge(FileMentionSearcherLive, services)
+  const withCommands = Layer.provideMerge(SessionCommandsLive, withMentionSearcher)
+  const withLifecycle = Layer.provideMerge(SessionLifecycleLive, withCommands)
+  const withProjectManager = Layer.provideMerge(ProjectManagerLive, withLifecycle)
+  const withProjectInspector = Layer.provideMerge(ProjectInspectorLive, withProjectManager)
+  const withProjectFiles = Layer.provideMerge(ProjectFileManagerLive, withProjectInspector)
+  const withActiveSessionStatuses = Layer.provideMerge(
+    ActiveSessionStatusesLive,
+    withProjectFiles
+  )
+  const withStreams = Layer.provideMerge(
+    DisplayViewStreamsLive,
+    withActiveSessionStatuses
+  )
+  return withStreams
+}
+
+const AcnBaseServicesLayer = (dataDir: string) =>
+  addCommonAcnServices(makeAcnServicesBase(false, dataDir))
+
+const AcnDebugServicesLayer = (dataDir: string) => {
+  const services = makeAcnServicesBase(true, dataDir)
+  const withDisplayIntrospection = Layer.provideMerge(
+    AcnDisplayViewIntrospectorLive,
+    services
+  )
+  return addCommonAcnServices(
+    Layer.provideMerge(AcnIntrospectorLive, withDisplayIntrospection)
+  )
+}
+
+/**
+ * The listener binds once, so network access is read from config.json here at startup; a change
+ * applies at the next service start. Anything unreadable means loopback only.
+ */
+/** Services that answer for the machine running this ACN: its settings and its harness configuration. */
+const withServerOwnedServices = <A, E, R>(base: Layer.Layer<A, E, R>, host: AcnHostApi, owner: AcnOwnerControl) =>
+  Layer.mergeAll(ServerSettingsLive, ChatModelDefaultsStoreLive, AcnHarnessConnectionsLive, Layer.succeed(AcnOwner, owner)).pipe(
+    Layer.provideMerge(base),
+    Layer.provide(Layer.succeed(AcnHost, host)),
+  )
+
+/**
+ * A container needs a key without a `network` block of its own, since it turns network access on at
+ * runtime. Its key is saved in a block that leaves network access off, so the directory, which may be a
+ * native installation's, never turns network access on outside the container.
+ */
+const keyOnlyNetwork = (): NetworkAccessConfig => ({ enabled: false, requireApiKey: true, allowedHosts: [] })
+
+/**
+ * Network access turned on in config.json by hand has no key, and without one every remote request is
+ * refused. The service makes the key then, as Settings does, and says where it is without printing it,
+ * except in a container, whose network access is always on and whose output is where people look.
+ */
+const ensureNetworkKey = (dataDir: string, network: NetworkAccess, container: Option.Option<ContainerInstallation>) => {
+  if (!network.enabled || !network.requireApiKey || Option.isSome(network.apiKey)) return Effect.succeed(network)
+  const storage = makeGlobalStorage({ root: dataDir })
+  const apiKey = generateApiKey()
+  return makeConfigStorage().pipe(
+    Effect.provideService(GlobalStorage, storage), Effect.provide(BunPath.layer),
+    Effect.flatMap(config => config.update(current => ({ ...current,
+      network: Option.some({ ...Option.getOrElse(current.network, keyOnlyNetwork), apiKey }) }))),
+    Effect.as({ ...network, apiKey: Option.some(apiKey) }),
+    // A container's output is its log, which only those who can already run commands in it read.
+    Effect.tap(() => Option.isSome(container)
+      ? Console.error([`Network access is on, with this key: ${apiKey}`,
+        "Send it as a bearer token from other containers and devices, or sign in with it in the browser app.",
+        `It is saved as network.apiKey in ${storage.paths.configFile}; read it again with \`docker exec <container> cat ${storage.paths.configFile}\`,`,
+        "or set your own with the MAGNITUDE_NETWORK_KEY environment variable."].join("\n"))
+      : Effect.logWarning(`Network access was on without a key, so Magnitude made one and saved it as network.apiKey in ${storage.paths.configFile}. `
+      + "Other computers need it: find it in Settings → Network access in the app on this computer, or run `magnitude server setup` again on a server.")),
+    Effect.catchAll(error => Effect.logWarning("Network access is on without a key, and a key could not be saved, so other computers can't connect. "
+      + "Turn network access on in Settings → Network access, or add a network.apiKey to config.json.").pipe(
+      Effect.annotateLogs({ cause: String(error) }), Effect.as(network))),
+  )
+}
+
+export const readNetworkAccess = (dataDir: string, container: Option.Option<ContainerInstallation> = Option.none()) =>
+  readStructuredFile(makeGlobalStorage({ root: dataDir }).paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
+    Effect.map((result) => result._tag === "Invalid" ? LOOPBACK_ONLY
+      : resolveNetworkAccess(containerNetworkConfig(container, result._tag === "Missing" ? Option.none() : result.value.network))),
+    Effect.tapError((error) => Effect.logWarning("Could not read network access from config.json; listening on loopback only").pipe(
+      Effect.annotateLogs({ cause: error.message }),
+    )),
+    Effect.orElseSucceed(() => LOOPBACK_ONLY),
+    Effect.flatMap((network) => ensureNetworkKey(dataDir, network, container)),
+    Effect.tap((network) => Option.isSome(network.warning) ? Effect.logWarning(network.warning.value) : Effect.void),
+    Effect.tap((network) => Effect.logInfo("Network access resolved").pipe(
+      Effect.annotateLogs({ bind: network.bind, requireApiKey: network.requireApiKey }),
+    )),
+  )
+
+const makeAcnInfrastructure = (
+  options: AcnServerOptions,
+  lifecycle: AcnServiceLifecycleApi,
+  bind: string,
+) => {
+  const dataDir = options.dataDir ?? defaultDataDir()
+  return Layer.mergeAll(
+    Layer.succeed(AcnServiceLifecycle, lifecycle),
+    Layer.succeed(
+      GlobalStorage,
+      GlobalStorage.of(makeGlobalStorage({ root: dataDir }))
+    ),
+    BunFileSystem.layer,
+    BunCommandExecutor.layer.pipe(Layer.provide(BunFileSystem.layer)),
+    BunPath.layer,
+    FetchHttpClient.layer,
+    BunHttpServer.layer({
+      port: options.port ?? ACN_PUBLIC_PORT,
+      hostname: bind,
+      idleTimeout: 0,
+    }),
+    HttpLayerRouter.layer,
+    RpcSerialization.layerNdjson,
+    TracingLayer
+  )
+}
+
+export const proxyInferenceWebRequest = async (
+  source: Request,
+  icn: InferenceProxyTarget,
+  fetchTarget: InferenceFetch = fetch,
+  signal: AbortSignal = source.signal,
+): Promise<Response> => {
+  return proxyOpenAiInferenceRequest(source, icn, fetchTarget, signal)
+}
+
+const makeCodexWebSocketProxy = (
+  request: HttpServerRequest.HttpServerRequest,
+  source: Request,
+  icn: InferenceProxyTarget,
+  usage: ServingUsage | undefined,
+) => Effect.scoped(Effect.gen(function* () {
+  const incoming = yield* request.upgrade
+  type ClientEvent =
+    | { readonly _tag: "Message"; readonly message: string | Uint8Array }
+    | { readonly _tag: "Closed" }
+  const messages = yield* Queue.unbounded<ClientEvent>()
+  yield* incoming.runRaw((message) => Queue.offer(messages, { _tag: "Message", message })).pipe(
+    Effect.onExit(() => Queue.offer(messages, { _tag: "Closed" })),
+    Effect.forkScoped,
+  )
+  const incomingWriter = yield* incoming.writer
+  const BunWebSocket = WebSocket as unknown as new (
+    url: string | URL,
+    options: { readonly headers: Readonly<Record<string, string>> },
+  ) => WebSocket
+  let active: {
+    readonly key: string
+    readonly observer: ReturnType<typeof makeUsageWebSocket> | undefined
+    readonly scope: Scope.CloseableScope
+    readonly writer: (
+      chunk: Uint8Array | string | PlatformSocket.CloseEvent,
+    ) => Effect.Effect<void, PlatformSocket.SocketError>
+  } | undefined
+  while (true) {
+    const event = yield* Queue.take(messages)
+    if (event._tag === "Closed") break
+    const target = codexWebSocketTarget(event.message, source.headers, icn)
+    if (target._tag === "Invalid") {
+      yield* incomingWriter(new PlatformSocket.CloseEvent(1008, target.message))
+      break
+    }
+    const key = `${target.route}:${target.url.href}`
+    if (active?.key !== key) {
+      if (active !== undefined) yield* Scope.close(active.scope, Exit.void)
+      const outgoingScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(outgoingScope, Exit.void))
+      const outgoing = yield* PlatformSocket.fromWebSocket(Effect.acquireRelease(
+        Effect.sync(() => new BunWebSocket(target.url, {
+          headers: Object.fromEntries(target.headers.entries()),
+        })),
+        (socket) => Effect.sync(() => socket.close(1000)),
+      )).pipe(Scope.extend(outgoingScope))
+      const writer = yield* outgoing.writer
+      const observer = target.route === "local" && usage ? makeUsageWebSocket(usage) : undefined
+      if (observer) yield* Scope.addFinalizer(outgoingScope, observer.close())
+      yield* outgoing.runRaw((message) => (observer?.received(message) ?? Effect.void).pipe(
+        Effect.zipRight(incomingWriter(message)),
+      )).pipe(
+        Effect.onExit((exit) => Exit.isInterrupted(exit)
+          ? Effect.void
+          : incomingWriter(new PlatformSocket.CloseEvent(
+            1011,
+            "Upstream WebSocket closed",
+          )).pipe(Effect.ignore)),
+        Effect.forkIn(outgoingScope),
+      )
+      active = { key, scope: outgoingScope, writer, observer }
+    }
+    yield* (active.observer?.sent(target.firstMessage) ?? Effect.void)
+    const sent = yield* active.writer(target.firstMessage).pipe(Effect.either)
+    if (sent._tag === "Left") {
+      yield* incomingWriter(new PlatformSocket.CloseEvent(
+        1011,
+        "Unable to write to upstream WebSocket",
+      )).pipe(Effect.ignore)
+      break
+    }
+  }
+  return HttpServerResponse.empty()
+})).pipe(
+  Effect.catchAllCause((cause) => Effect.logDebug(
+    "Codex WebSocket proxy closed",
+    Cause.pretty(cause),
+  ).pipe(Effect.as(HttpServerResponse.empty()))),
+)
+
+const makeInferenceProxy = (
+  icn: InferenceProxyTarget,
+  protocol: "openai" | "anthropic" | "codex" | "claude-code",
+  network: NetworkAccess,
+  fetchTarget: InferenceFetch = fetch,
+  usage?: ServingUsage,
+  activity?: InferenceActivityApi,
+) => {
+  const anthropicGateway = protocol === "claude-code"
+    ? makeAnthropicGateway(icn, fetchTarget)
+    : undefined
+  const codexGateway = protocol === "codex" ? makeCodexGateway(icn, fetchTarget) : undefined
+  return (request: HttpServerRequest.HttpServerRequest) => Effect.gen(function* () {
+    // The wildcard proxy route is also the most specific OPTIONS route. Handle
+    // browser preflight locally instead of forwarding it to an ICN operation.
+    if (request.method === "OPTIONS") return yield* OptionsRouteHandler(request)
+    const source = request.source
+    if (!(source instanceof Request)) {
+      return HttpServerResponse.text("Unsupported request transport", { status: 500 })
+    }
+    if (!isLocalCaller(request, network) && !authorizesRemoteInference({
+      authorization: request.headers.authorization,
+      "x-api-key": request.headers["x-api-key"],
+    }, network)) {
+      return HttpServerResponse.unsafeJson({ error: {
+        message: "A Magnitude API key is required from other devices. Copy it from Settings → Network access and send it as a Bearer token.",
+        type: "authentication_error",
+      } }, { status: 401, headers: { "www-authenticate": "Bearer realm=\"magnitude\"" } })
+    }
+    if (protocol === "codex" && source.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const upgradeOrigin = source.headers.get("origin")
+      if (upgradeOrigin !== null && !isAllowedCorsOrigin(upgradeOrigin)) {
+        return HttpServerResponse.empty({ status: 403 })
+      }
+      const proxy = makeCodexWebSocketProxy(request, source, icn, usage)
+      return yield* activity === undefined ? proxy : Effect.scoped(activity.hold.pipe(Effect.zipRight(proxy)))
+    }
+    // A request counts as activity from here until its response body ends.
+    const finish = activity === undefined ? () => {} : yield* activity.begin
+    const route: Effect.Effect<Either.Either<Response, unknown>> = anthropicGateway !== undefined
+      ? anthropicGateway.route(source).pipe(Effect.either)
+      : codexGateway !== undefined
+        ? codexGateway.route(source).pipe(Effect.either)
+        : Effect.tryPromise({
+          try: (signal) => protocol === "openai"
+            ? proxyInferenceWebRequest(source, icn, fetchTarget, signal)
+            : proxyLocalAnthropicInferenceRequest(source, icn, fetchTarget, signal),
+          catch: (cause) => new InferenceProxyFailed({ cause }),
+        }).pipe(Effect.either)
+    const response = yield* route.pipe(Effect.onInterrupt(() => Effect.sync(finish)))
+    if (response._tag === "Right") {
+      return HttpServerResponse.fromWeb(finishWithBody(response.right, finish))
+    }
+    finish()
+    yield* Effect.logError("Inference gateway failed", response.left)
+    const requestId = `req_acn_gateway_${Date.now()}`
+    const body = protocol === "anthropic" || protocol === "claude-code"
+      ? {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "Local inference gateway unavailable",
+          },
+          request_id: requestId,
+        }
+      : {
+          error: {
+            message: "Local inference gateway unavailable",
+            type: "server_error",
+            param: null,
+            code: "gateway_unavailable",
+          },
+        }
+    return yield* HttpServerResponse.json(body, {
+      status: 502,
+      headers: { "request-id": requestId },
+    }).pipe(Effect.orDie)
+  })
+}
+
+const ROOT_BODY = [
+  "Magnitude local service.",
+  "",
+  "OpenAI-compatible API:     /inference/v1",
+  "Anthropic-compatible API:  /inference/anthropic",
+  "Available models:          /inference/v1/models",
+  "",
+  "Documentation: https://docs.magnitude.dev/integrations/other-agents",
+  "",
+].join("\n")
+
+const invalidHostMessage = (network: NetworkAccess, container: boolean) => network.enabled
+  ? `Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json${container ? ", and any name from a request that sends the network access key" : ""}.`
+  : "Invalid Host header. Network access is off; turn it on in Magnitude Settings to reach this service from other devices."
+
+export const installAcnHealthRoutes = (
+  router: HttpLayerRouter.HttpRouter,
+  lifecycle: AcnServiceLifecycleApi,
+  remote: RemoteAccessApi,
+  container = false,
+) => Effect.gen(function* () {
+  const network = remote.network
+  yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    if (!admitsRequestHost({ host: request.headers.host, authorization: request.headers.authorization,
+      "x-api-key": request.headers["x-api-key"] }, network, container)) {
+      return HttpServerResponse.text(invalidHostMessage(network, container), { status: 421 })
+    }
+    return withCors(yield* responseEffect, request)
+  }))
+  yield* router.add("OPTIONS", "/*", OptionsRouteHandler)
+  // The browser app is served even while the service starts, so it can show that state.
+  const fs = yield* FileSystem.FileSystem
+  const webApp = yield* resolveWebAppSource
+  yield* router.add("GET", "/", serveWebApp(webApp, fs))
+  yield* router.add("GET", "/*", serveWebApp(webApp, fs))
+  yield* router.add("GET", "/inference", Effect.succeed(HttpServerResponse.text(ROOT_BODY)))
+  yield* installRemoteAccessRoutes(router, remote)
+  yield* router.add("GET", "/health", Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    const state = yield* lifecycle.state
+    const status = state._tag === "Ready" ? 200 : 503
+    // Anonymous remote callers learn readiness only; the instance identity fences RPC clients.
+    if ((yield* remote.access(request)) === "Anonymous") {
+      return HttpServerResponse.unsafeJson({ service: "magnitude-acn", version: ACN_VERSION, state: { _tag: state._tag } }, { status })
+    }
+    const body = yield* encodeHealthResponse(makeHealthResponse(ACN_VERSION, state))
+    return yield* HttpServerResponse.json(body, { status })
+  }).pipe(Effect.orDie))
+})
+
+export const installAcnPublicRoutes = (
+  router: HttpLayerRouter.HttpRouter,
+  lifecycle: AcnServiceLifecycleApi,
+  icn: InferenceProxyTarget,
+  remote: RemoteAccessApi,
+  fetchTarget: InferenceFetch = fetch,
+  usage?: ServingUsage,
+  activity?: InferenceActivityApi,
+) => Effect.gen(function* () {
+  const network = remote.network
+  yield* router.add("POST", "/rpc", Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    // Application control from another device needs a signed-in browser on a page this service served.
+    const access = yield* remote.access(request)
+    if (access === "Anonymous") {
+      return HttpServerResponse.text("Sign in to Magnitude with the Network access key to control it from another device.", { status: 401 })
+    }
+    if (access === "SignedIn" && !isSameOrigin(request)) {
+      return HttpServerResponse.text("Magnitude application control accepts requests only from its own pages.", { status: 403 })
+    }
+    return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
+      ? yield* lifecycle.dispatchRpc
+      : HttpServerResponse.empty({ status: 409 })
+  }))
+  yield* router.prefixed("/inference/v1/proxies/codex").add(
+    "*", "/*", makeInferenceProxy(icn, "codex", network, fetchTarget, usage, activity),
+  )
+  yield* router.prefixed("/inference/v1").add(
+    "*", "/*", makeInferenceProxy(icn, "openai", network, fetchTarget, undefined, activity),
+  )
+  yield* router.prefixed("/inference/anthropic/proxies/claude-code").add(
+    "*", "/*", makeInferenceProxy(icn, "claude-code", network, fetchTarget, undefined, activity),
+  )
+  yield* router.prefixed("/inference/anthropic").add(
+    "*", "/*", makeInferenceProxy(icn, "anthropic", network, fetchTarget, undefined, activity),
+  )
+})
+
+/** All interfaces, IPv6 as well as IPv4, unless the host can't listen on IPv6 (a kernel booted without it). */
+const allInterfacesListenAddress = Effect.try(() => Bun.serve({ hostname: "::", port: 0, fetch: () => new Response() }).stop(true)).pipe(
+  Effect.as("::"),
+  Effect.orElseSucceed(() => ALL_INTERFACES_BIND),
+)
+
+export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerControl) =>
+  Effect.scoped(Effect.gen(function* () {
+    const dataDir = options.dataDir ?? defaultDataDir()
+    const debug = options.debug === true
+    yield* owner.awaitStart
+
+    const lifecycle = yield* makeAcnServiceLifecycle()
+    const healthReportingFinished = yield* Deferred.make<void, JsonLineChannelFailed>()
+    // Owner communication outlives application acquisition and its failed scopes.
+    // Register this first so application teardown can await its terminal write.
+    yield* lifecycle.changes.pipe(
+      Stream.takeUntil(state => state._tag === "Stopping"),
+      Stream.runForEach(state => owner.reportHealth(makeHealthResponse(ACN_VERSION, state))),
+      Effect.tapError(error => lifecycle.beginStopping({ reason: "fatal", detail: error.message })),
+      Effect.intoDeferred(healthReportingFinished),
+      Effect.forkScoped,
+    )
+    const applicationScope = yield* Scope.make()
+    const closeApplicationScope = yield* Effect.cached(lifecycle.state.pipe(
+      Effect.flatMap(state => state._tag === "Stopping"
+        ? healthReportingFinished.pipe(Effect.timeoutOption("2 seconds"), Effect.catchAll(Effect.logError), Effect.asVoid)
+        : Effect.void),
+      Effect.ensuring(closeApplication(applicationScope)),
+    ))
+    yield* Effect.addFinalizer(() => closeApplicationScope)
+    const container = yield* readContainerInstallation().pipe(Effect.provide(BunFileSystem.layer))
+    const network = yield* readNetworkAccess(dataDir, container).pipe(Effect.provide(BunFileSystem.layer))
+    // Loopback always listens; all-interfaces subsumes it, any other address is added beside it.
+    const primaryBind = network.bind === ALL_INTERFACES_BIND ? yield* allInterfacesListenAddress : "127.0.0.1"
+    const infrastructure = yield* Layer.buildWithScope(
+      makeAcnInfrastructure(options, lifecycle, primaryBind),
+      applicationScope,
+    )
+    const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
+    const server = Context.get(infrastructure, HttpServer.HttpServer)
+    const sessions = yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    const remote = yield* makeRemoteAccess(network, sessions)
+    yield* installAcnHealthRoutes(router, lifecycle, remote, Option.isSome(container)).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
+    if (network.enabled && network.bind !== ALL_INTERFACES_BIND && network.bind !== primaryBind) {
+      const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
+        port: options.port ?? ACN_PUBLIC_PORT,
+        hostname: network.bind,
+        idleTimeout: 0,
+      }), applicationScope)
+      const additionalServer = Context.get(additional, HttpServer.HttpServer)
+      yield* additionalServer.serve(router.asHttpEffect()).pipe(Effect.provide(Context.merge(infrastructure, additional)))
+    }
+    yield* owner.awaitShutdown.pipe(
+      Effect.zipRight(lifecycle.beginStopping({ reason: "administrative" })),
+      Effect.catchAll(error => lifecycle.beginStopping({ reason: "fatal", detail: error.message })),
+      Effect.forkIn(applicationScope),
+    )
+
+    yield* Layer.buildWithScope(AcnProcessHandlersLive, applicationScope).pipe(
+      Effect.provide(infrastructure),
+    )
+
+    yield* lifecycle.reportStarting("Resolving", Option.none())
+    const application = Effect.gen(function* () {
+      const builtServices = yield* debug
+        ? Layer.buildWithScope(withServerOwnedServices(AcnDebugServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container }, owner), applicationScope).pipe(
+            Effect.provide(infrastructure),
+            Effect.map((context) => ({
+              context,
+              introspector: Option.some(Context.get(context, AcnIntrospector)),
+            })),
+          )
+        : Layer.buildWithScope(withServerOwnedServices(AcnBaseServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container }, owner), applicationScope).pipe(
+            Effect.provide(infrastructure),
+            Effect.map((context) => ({
+              context,
+              introspector: Option.none<AcnIntrospectorApi>(),
+            })),
+          )
+      const serviceContext = Context.merge(infrastructure, builtServices.context)
+      const handlers = yield* Layer.buildWithScope(AcnBoundaryLive, applicationScope).pipe(
+        Effect.provide(serviceContext),
+      )
+      const applicationContext = Context.merge(serviceContext, handlers)
+      const rpcRouter = yield* HttpLayerRouter.make
+      const rawProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+        Effect.provideService(HttpLayerRouter.HttpRouter, rpcRouter),
+        Effect.provide(infrastructure),
+      )
+      const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
+        Effect.provide(applicationContext),
+      )
+      yield* RpcServer.make(AcnRpcGroup, acnRpcServerOptions).pipe(
+        Effect.provideService(RpcServer.Protocol, protocol),
+        Effect.provide(applicationContext),
+        Effect.forkIn(applicationScope),
+      )
+      if (Option.isSome(builtServices.introspector)) {
+        yield* installAcnIntrospectionRoutes(router, builtServices.introspector.value)
+      }
+      const icn = Context.get(applicationContext, IcnProcess)
+      const usage = Context.get(applicationContext, ServingUsage)
+      yield* installAcnPublicRoutes(router, lifecycle, icn, remote, makeUsageFetch(icn.origin, usage), usage,
+        Context.get(applicationContext, InferenceActivity))
+      const hardware = yield* Context.get(applicationContext, IcnHardware).get.pipe(
+        Effect.map(({ state }) => Option.some(state)),
+        Effect.catchAll(() => Effect.succeed(Option.none())),
+      )
+      const instances = yield* Context.get(applicationContext, IcnInstances).get
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie),
+        Option.map(hardware, snapshot => ({ hardware: snapshot, instances })))
+      return {
+        subscriptions: Context.get(applicationContext, AcnSubscriptions),
+        icn,
+      }
+    })
+
+    // An engine download or a wait to retry it keeps reporting progress; only silence means startup is stuck.
+    const startupSilence = lifecycle.changes.pipe(
+      Stream.timeoutFail(
+        () => new Cause.TimeoutException("ACN startup reported no progress for 5 minutes"),
+        Duration.minutes(5),
+      ),
+      Stream.runDrain,
+    )
+    const startup = Effect.raceFirst(application, startupSilence.pipe(Effect.zipRight(Effect.never))).pipe(
+      Effect.tapErrorCause((cause) => lifecycle.beginStopping({
+        reason: "startup-failed",
+        detail: acnStartupFailureDetail(cause),
+        permanent: Option.exists(Cause.failureOption(cause), failure => failure instanceof ReleaseIcnInstallationError && failure.permanent),
+      }).pipe(Effect.zipRight(logStartupFailure(cause)))),
+    )
+    const started = yield* Effect.raceFirst(
+      startup.pipe(Effect.disconnect, Effect.map(Option.some)),
+      lifecycle.awaitStopping.pipe(Effect.map(() => Option.none())),
+    )
+    const request = yield* lifecycle.awaitStopping
+    if (Option.isNone(started)) {
+      yield* closeApplicationScope
+    } else {
+      const { subscriptions, icn } = started.value
+      yield* (request.reason === "administrative" ? Effect.logDebug : Effect.logInfo)("ACN shutdown requested").pipe(Effect.annotateLogs({
+        reason: request.reason,
+        detail: Option.getOrNull(request.safeDetail),
+      }))
+      yield* boundedShutdownStep(subscriptions.terminate)
+      yield* closeApplicationScope
+      yield* boundedShutdownStep(icn.shutdown, Duration.seconds(2))
+    }
+    if (request.reason === "fatal"
+      || request.reason === "icn-exited"
+      || request.reason === "startup-failed") {
+      return yield* new AcnRestartRequired({
+        reason: request.reason,
+        message: Option.getOrElse(request.safeDetail, () => `ACN stopped because ${request.reason}`),
+      })
+    }
+  }))

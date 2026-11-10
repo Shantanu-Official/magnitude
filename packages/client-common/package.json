@@ -1,0 +1,40 @@
+{
+  "name": "@magnitudedev/client-common",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./application/contracts": {
+      "types": "./src/application/contracts.ts",
+      "import": "./src/application/contracts.ts"
+    },
+    "./fixtures/*": {
+      "magnitude-test": "./src/application/fixtures/*.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@magnitudedev/sdk": "workspace:*",
+    "@magnitudedev/effect-query": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "@effect-atom/atom-react": "^0.5.0",
+    "@effect/rpc": "0.75.1",
+    "@effect/platform": "^0.96.0",
+    "react": "^19.0.0",
+    "effect": "^3.21.2"
+  },
+  "devDependencies": {
+    "@types/react-test-renderer": "^19.1.0",
+    "@types/react": "^19.0.0",
+    "react-test-renderer": "^19.1.1",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,63 @@
+---
+title: "Pi"
+description: "Connect Pi to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent#quick-start) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → Pi** and click **Connect**.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
+
+Use Pi’s `/model` selector to choose a model from the Magnitude provider. Normal Magnitude connections install the model configuration and skill; you do not need to install the Magnitude Pi extension.
+
+## Run Pi
+
+After connecting in Magnitude, start Pi with:
+
+```sh
+pi --provider magnitude --model MODEL_ID
+```
+
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+
+## Configuration
+
+**Connect** writes `~/.pi/agent/models.json`. Location overrides: `PI_CODING_AGENT_DIR`.
+
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Pi and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
+
+`~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "magnitude": {
+      "baseUrl": "http://ADDRESS:10100/inference/v1",
+      "api": "openai-completions",
+      "apiKey": "API_KEY",
+      "models": [
+        {
+          "id": "MODEL_ID",
+          "name": "MODEL_ID",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 32768,
+          "maxTokens": 8192
+        }
+      ]
+    }
+  }
+}
+```

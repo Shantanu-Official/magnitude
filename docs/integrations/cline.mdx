@@ -1,0 +1,62 @@
+---
+title: "Cline"
+description: "Connect Cline to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install Cline](https://docs.cline.bot/getting-started/installing-cline) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → Cline** and click **Connect**.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
+
+This connector detects the `cline` executable and manages its provider configuration. Having only an editor extension installed does not necessarily make this CLI integration available. Magnitude configures the OpenAI-compatible provider.
+
+## Run Cline
+
+After connecting in Magnitude, start Cline with:
+
+```sh
+cline --tui --provider openai-compatible --model MODEL_ID
+```
+
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+
+## Configuration
+
+**Connect** writes `~/.cline/data/settings/providers.json` and `~/.cline/data/settings/models.json`. Location overrides: `CLINE_DATA_DIR` and `CLINE_PROVIDER_SETTINGS_PATH`.
+
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Cline and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
+
+`~/.cline/data/settings/providers.json`:
+
+```json
+{
+  "providers": {
+    "openai-compatible": {
+      "settings": {
+        "provider": "openai-compatible",
+        "client": "openai-compatible",
+        "protocol": "openai-chat",
+        "baseUrl": "http://ADDRESS:10100/inference/v1",
+        "apiKey": "API_KEY",
+        "model": "MODEL_ID"
+      },
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "tokenSource": "manual"
+    }
+  },
+  "lastUsedProvider": "openai-compatible"
+}
+```
+
+Set `updatedAt` to the current time. Cline replaces a provider entry that has no `updatedAt` with its own stored settings the next time it starts.

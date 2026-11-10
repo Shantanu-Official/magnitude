@@ -1,0 +1,12 @@
+// Decode output (M <= DECODE_ROWS): the projections (`lib/routed/output.glsl`)
+// into scratch, in A, and their join (`lib/routed/output_sum.glsl`). The
+// Vulkan form of `metal/routed_output.metal`.
+#define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
+#define ROUTED_PROJECTED_KIND ROUTED_ACT
+#define ROUTED_PROJECTED_BASE SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PROJECTED)
+#define ROUTED_PROJECTED_INDEX(m, k, n) (((m) * (SEISMIC_DIM_K + 1ul) + (k)) * SEISMIC_DIM_H + (n))
+#include "lib/routed/output.glsl"
+#include "lib/routed/output_sum.glsl"
+
+void routed_output_project() { routed_output_projection(); }
+void routed_output_combine() { routed_output_join(false, 0ul); }

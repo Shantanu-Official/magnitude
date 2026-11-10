@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Magnitude ecosystem</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 1600px;
+      height: 600px;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    body {
+      --text: #f8fafc;
+      --muted: #93a1b6;
+      --tile: #152234;
+      --tile-border: #2c3b50;
+      --container: #121d2c;
+      --container-border: #435875;
+      --connector: #6680a5;
+      color: var(--text);
+    }
+
+    body.light {
+      --text: #0f172a;
+      --muted: #64748b;
+      --tile: #ffffff;
+      --tile-border: #d8dee8;
+      --container: #f1f5f9;
+      --container-border: #94a3b8;
+      --connector: #64748b;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+    }
+
+    .composition {
+      position: relative;
+      width: 1350px;
+      height: 450px;
+    }
+
+    .tile {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      justify-content: center;
+      padding: 14px;
+      border: 1px solid var(--tile-border);
+      border-radius: 18px;
+      background: var(--tile);
+    }
+
+    .harnesses {
+      position: absolute;
+      top: 36px;
+      left: 0;
+      width: 344px;
+    }
+
+    .group-label {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 24px;
+      letter-spacing: .12em;
+    }
+
+    .harness-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 164px);
+      grid-template-rows: repeat(3, 104px);
+      column-gap: 16px;
+      row-gap: 14px;
+    }
+
+    .harness-tile {
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .harness-logo {
+      width: 48px;
+      height: 48px;
+      object-fit: contain;
+    }
+
+    .harness-name {
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 680;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .connector {
+      position: absolute;
+      top: 224px;
+      left: 344px;
+      width: 186px;
+      height: 2px;
+      background: var(--connector);
+    }
+
+    .magnitude-box {
+      position: absolute;
+      top: 45px;
+      left: 530px;
+      width: 820px;
+      height: 360px;
+      padding: 22px 24px 24px;
+      border: 1px solid var(--container-border);
+      border-radius: 26px;
+      background: var(--container);
+    }
+
+    .magnitude-header {
+      display: flex;
+      height: 74px;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 9px;
+    }
+
+    .magnitude-wordmark {
+      width: 226px;
+      max-height: 48px;
+      object-fit: contain;
+    }
+
+    .magnitude-label {
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: .12em;
+    }
+
+    .models { margin-top: 14px; }
+
+    .model-row {
+      display: grid;
+      gap: 14px;
+    }
+
+    .model-row + .model-row { margin-top: 14px; }
+    .model-row-top { grid-template-columns: 360px 192px 192px; }
+    .model-row-bottom { grid-template-columns: repeat(2, 379px); }
+    .model-tile { height: 106px; }
+
+    .model-logo {
+      max-width: 100%;
+      max-height: 54px;
+      object-fit: contain;
+    }
+
+    .qwen-lockup,
+    .gemma-lockup {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .qwen-lockup .model-icon,
+    .gemma-lockup .model-icon {
+      width: 46px;
+      height: 46px;
+      object-fit: contain;
+    }
+
+    .qwen-lockup .model-logo { width: 142px; }
+    .gemma-lockup .model-logo { width: 142px; }
+    .nvidia-logo { width: 92px; }
+    .zai-logo { width: 72px; }
+    .deepseek-logo { width: 220px; }
+
+    .only-light { display: none; }
+    body.light .only-dark { display: none; }
+    body.light .only-light { display: block; }
+    body.dark .dark-invert { filter: brightness(0) invert(1); }
+    body.light .light-darken { filter: brightness(0) saturate(100%); }
+  </style>
+  <script>
+    const requestedTheme = new URLSearchParams(location.search).get('theme')
+    const theme = requestedTheme === 'light' || requestedTheme === 'dark'
+      ? requestedTheme
+      : matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+    document.documentElement.style.colorScheme = theme
+    addEventListener('DOMContentLoaded', () => document.body.classList.add(theme))
+  </script>
+</head>
+<body>
+  <main class="stage">
+    <div class="composition">
+      <section class="harnesses">
+        <h1 class="group-label">YOUR EXISTING AGENT</h1>
+        <div class="harness-grid">
+          <div class="tile harness-tile"><img class="harness-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/pi.svg" alt=""><span class="harness-name">Pi</span></div>
+          <div class="tile harness-tile"><img class="harness-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/opencode.svg" alt=""><span class="harness-name">OpenCode</span></div>
+          <div class="tile harness-tile"><img class="harness-logo" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/hermes.svg" alt=""><span class="harness-name">Hermes</span></div>
+          <div class="tile harness-tile"><img class="harness-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/codex.svg" alt=""><span class="harness-name">Codex</span></div>
+          <div class="tile harness-tile"><img class="harness-logo" src="../../../magnitude-dev-landing/src/assets/logos/claude.svg" alt=""><span class="harness-name">Claude Code</span></div>
+          <div class="tile harness-tile"><img class="harness-logo" src="../../../magnitude-dev-landing/src/assets/logos/harnesses/openclaw.svg" alt=""><span class="harness-name">OpenClaw</span></div>
+        </div>
+      </section>
+
+      <div class="connector" aria-hidden="true"></div>
+
+      <section class="magnitude-box">
+        <header class="magnitude-header">
+          <img class="magnitude-wordmark only-dark" src="../../../magnitude-dev-landing/src/assets/wordmark-white.svg" alt="Magnitude">
+          <img class="magnitude-wordmark only-light light-darken" src="../../../magnitude-dev-landing/src/assets/wordmark-white.svg" alt="Magnitude">
+          <span class="magnitude-label">LOCAL MODELS FOR YOUR MACHINE</span>
+        </header>
+
+        <div class="models">
+          <div class="model-row model-row-top">
+            <div class="tile model-tile qwen-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/qwen.svg" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/qwen-wordmark.svg" alt="Qwen"></div>
+            <div class="tile model-tile"><img class="model-logo nvidia-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/nvidia.svg" alt="NVIDIA"></div>
+            <div class="tile model-tile"><img class="model-logo zai-logo light-darken" src="../../../magnitude-dev-landing/src/assets/logos/zai.svg" alt="Z.ai"></div>
+          </div>
+          <div class="model-row model-row-bottom">
+            <div class="tile model-tile"><img class="model-logo deepseek-logo" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/deepseek.svg" alt="DeepSeek"></div>
+            <div class="tile model-tile gemma-lockup"><img class="model-icon" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-icon-trimmed.png" alt=""><img class="model-logo dark-invert" src="../../../magnitude-dev-landing/src/assets/logos/expanded-wordmarks/gemma-wordmark.svg" alt="Gemma"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

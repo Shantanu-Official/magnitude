@@ -1,0 +1,59 @@
+{
+  "name": "@magnitudedev/pi-extension",
+  "private": true,
+  "version": "0.0.2",
+  "description": "Run local AI models in Pi with Magnitude",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magnitudedev/magnitude.git",
+    "directory": "integrations/pi"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "pi": {
+    "image": "https://raw.githubusercontent.com/magnitudedev/magnitude/main/assets/readme/pi-preview.png",
+    "extensions": [
+      "./dist/magnitude.js"
+    ]
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "prepack": "bun run build",
+    "typecheck": "tsc --noEmit",
+    "test": "bunx --bun vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.83.0",
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
+    "@earendil-works/pi-tui": ">=0.83.0"
+  },
+  "devDependencies": {
+    "@magnitudedev/client-common": "workspace:*",
+    "@effect/platform-bun": "^0.90.0",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/utils": "workspace:*",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@types/bun": "1.3.14",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4",
+    "@magnitudedev/sdk": "workspace:*"
+  },
+  "dependencies": {
+    "effect": "3.21.2",
+    "@effect/platform": "0.96.1",
+    "@effect/platform-node": "0.107.0",
+    "@effect/rpc": "0.75.1"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "magnitude",
+    "local-models"
+  ]
+}

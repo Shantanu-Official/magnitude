@@ -1,0 +1,3959 @@
+use super::specialization::{Specializer, Tuning};
+use super::readout::{ReadoutRecipe, RecipePreparation};
+use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
+use super::tuning::{
+    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
+    attention::{
+        AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
+        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
+        IndexerProjectTuning, LowRankQueryProjectTuning, PooledProjectInput,
+        PooledProjectTuning, PrefillListing, history_window, picked_rows,
+    },
+    cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
+    general_routed::{
+        RoutedDownProjectTuning, RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning, RoutedGateUpTuning,
+        RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectStreamedTuning,
+        RoutedSelectTuning, RoutedUpTilesTuning, RoutedUpTuning, routing_shape,
+    },
+    post_norm::ProjectRowsTuning,
+    readout::{
+        DraftRowsTuning, HeadRowsTuning, PreparedProjectionTuning, SampleRowsTuning,
+        SelectedRowsTuning, ShapeRowsTuning,
+    },
+    recurrent::{
+        RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectConvolvedTuning,
+        RecurrentProjectTuning, RecurrentShape, RecurrentState, RecurrentStepConvolvedTuning,
+        RecurrentStepTuning,
+    },
+    routed::{
+        RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
+        RoutedGroupTuning, RoutedOutputProjectTuning, RoutedOutputTuning, RoutedRouteSharedTuning,
+        RoutedRouteStreamedTuning,
+        RoutedRouteTuning, RoutedShape,
+    },
+    short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
+    state_space::{
+        StateSpaceChunkTuning, StateSpaceOutputTuning, StateSpaceProjectTuning, StateSpaceState,
+        StateSpaceStepTuning,
+    },
+};
+use super::*;
+use crate::operators::attention::pooled::Pooling;
+use crate::operators::gated_delta::graph::StepForm;
+use crate::operators::routed::fused_graph::DecodeForm;
+use crate::operators::streams::{BlockStreams, SinkhornBinding, SiteEntryBindings};
+use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
+use crate::{
+    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
+    StateSpaceBinding, SublayerTail,
+};
+use magnitude_family_contracts::{
+    ModelDefinition, SublayerIndex, WeightKind, WeightScope,
+};
+use magnitude_kernels::{
+    attention_append_dense, candidate_blocks, candidate_rows, cluster_token_rows,
+    conditioning_overlay, corrector_attention,
+    corrector_factors, corrector_features, corrector_nodes, corrector_path, corrector_rows,
+    draft_convolve_input,
+    draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
+    feature_rows, import_dense, indexer_keys, indexer_score, moe_tail, ngram_add, ngram_gate,
+    ngram_inject, ngram_rows, pool_rows, rows_topk,
+    packing_bound,
+    per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
+    selection_notice, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
+    token_confidence, widen_rows,
+};
+use seismic::KernelRequest;
+use std::collections::HashSet;
+use std::{cell::RefCell, rc::Rc};
+/// Each recipe's formed levels, by the programs they are.
+type ReadoutRecipeStates = Rc<RefCell<HashMap<String, RecipePreparation>>>;
+
+/// The affine Metal matrix form can share one decoded tile across four
+/// rows for these head geometries. Give that row band its own objective,
+/// independently of the model or the configuration that tuning selects.
+pub(super) fn separates_packed_attention_rows(
+    backend: seismic::BackendName,
+    group: u64,
+    width: u64,
+    max_rows: u64,
+) -> bool {
+    backend == seismic::BackendName::Metal
+        && (1..=8).contains(&group)
+        && matches!(width, 128 | 256)
+        && max_rows >= 4
+}
+
+/// The phase-one catalog. Every handle is prepared before qualification and
+/// retained for warm calls; this type has no API capable of preparing again.
+#[derive(Debug)]
+pub(super) struct NativePreparationCache {
+    pub(super) owner: Tensor,
+    pub(super) import: ImportKernels,
+    pub(super) glue: GlueKernels,
+    pub(super) target: TargetKernels,
+    pub(super) head: Option<HeadKernels>,
+    pub(super) shared_head: Option<SharedHeadKernels>,
+    pub(super) draft: Option<DraftKernels>,
+    pub(super) vision: Option<VisionKernels>,
+    pub(super) tuned: Vec<TunedEntry>,
+    /// Units prepared at their canonical defaults for want of a stored
+    /// tuning record.
+    pub(super) unprepared: usize,
+    pub(super) readout_choices: Vec<crate::ReadoutClassChoice>,
+}
+
+/// Everything program preparation reads.
+pub(super) struct PreparationInputs<'a> {
+    pub device: &'a Device,
+    pub plan: &'a ProgramPlan,
+    pub load: &'a ModelLoadPlan,
+    pub limits: TuningLimits,
+    pub tuning: TuningContext<'a>,
+    /// What a search is held to; a load, which never searches, has none.
+    pub room: Option<super::tuning::TuningRoom>,
+    pub selection_limits: crate::ResourceLimits,
+    pub graph_demand: GraphInvocationDemand,
+}
+
+/// Prepare one entry that has no tuning case. Evaluates to `Option`: `None`
+/// during a count or a listing.
+macro_rules! fixed {
+    ($spec:expr, $module:ident, $bindings:expr, $elements:expr) => {
+        fixed!($spec, $module, $bindings, $elements, statics & [])
+    };
+    ($spec:expr, $module:ident, $bindings:expr, $elements:expr, statics $statics:expr) => {
+        $spec.fixed(&$bindings, $statics, $module::native_entry_with($elements))?
+    };
+    ($spec:expr, $module:ident, $bindings:expr) => {
+        $spec.fixed(&$bindings, &[], $module::native_entry())?
+    };
+}
+
+/// The layers each binding is prepared for, in model order. Tuning cases
+/// rotate through these layers' resident weights.
+struct BindingLayers<K> {
+    layers: HashMap<K, Vec<WeightScope>>,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> BindingLayers<K> {
+    fn of(bindings: impl IntoIterator<Item = (K, WeightScope)>) -> Self {
+        let mut layers: HashMap<K, Vec<WeightScope>> = HashMap::new();
+        for (binding, scope) in bindings {
+            layers.entry(binding).or_default().push(scope);
+        }
+        Self { layers }
+    }
+
+    fn scopes(&self, binding: K) -> Vec<WeightScope> {
+        self.layers[&binding].clone()
+    }
+}
+
+/// Each distinct binding of `bindings` in order of first appearance, with
+/// the layers it is prepared for in model order.
+fn ordered_layers<K: Eq>(
+    bindings: impl IntoIterator<Item = (K, WeightScope)>,
+) -> Vec<(K, Vec<WeightScope>)> {
+    let mut ordered: Vec<(K, Vec<WeightScope>)> = Vec::new();
+    for (binding, scope) in bindings {
+        match ordered.iter_mut().find(|(known, _)| *known == binding) {
+            Some((_, scopes)) => scopes.push(scope),
+            None => ordered.push((binding, vec![scope])),
+        }
+    }
+    ordered
+}
+
+/// A streamed binding's kernel of each `AHEAD` (`LEADS`: without hints,
+/// then at each count of leads) one of its layers launches, none of an
+/// `AHEAD` none does; or the first `AHEAD`'s failure; none where a launched
+/// one formed none (a count or a listing, which forms nothing at every
+/// `AHEAD`).
+fn each_lead<K>(
+    leads: [Option<Result<Option<K>, CatalogFailure>>; super::LEADS],
+) -> Result<Option<[Option<K>; super::LEADS]>, CatalogFailure> {
+    let leads = leads.into_iter().map(Option::transpose).collect::<Result<Vec<_>, _>>()?;
+    // An `AHEAD` no layer launches is whole without a kernel.
+    let formed = leads
+        .into_iter()
+        .map(|lead| match lead {
+            None => Some(None),
+            Some(kernel) => kernel.map(Some),
+        })
+        .collect::<Option<Vec<_>>>();
+    Ok(formed.map(|formed| formed.try_into().unwrap_or_else(|_| unreachable!("a kernel slot per AHEAD"))))
+}
+
+/// The scope of sublayer `sublayer` (0 the mixer, 1 the feed-forward) of
+/// target block `index`.
+fn sublayer_scope(index: usize, sublayer: u32) -> WeightScope {
+    WeightScope::TargetSublayer(SublayerIndex {
+        block: u32::try_from(index).expect("block count fits u32"),
+        sublayer,
+    })
+}
+
+fn head_scope(index: usize) -> WeightScope {
+    WeightScope::HeadBlock(u32::try_from(index).expect("head block count fits u32"))
+}
+
+fn head_sublayer_scope(index: usize, sublayer: u32) -> WeightScope {
+    WeightScope::HeadSublayer(SublayerIndex {
+        block: u32::try_from(index).expect("head block count fits u32"),
+        sublayer,
+    })
+}
+
+impl NativePreparationCache {
+    /// A load's preparation: one walk forms every entry at the choice its
+    /// stored tuning record names, or at its canonical default where no
+    /// record is stored, when the load serves defaults; a load that reports
+    /// such units ends at the first with [`CatalogFailure::Unprepared`].
+    /// Nothing is searched, measured or published.
+    pub(super) fn prepare_programs(
+        inputs: PreparationInputs<'_>,
+        unprepared: super::tuning::UnpreparedUnits,
+    ) -> Result<Self, CatalogFailure> {
+        let PreparationInputs {
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            room: _,
+            selection_limits,
+            graph_demand,
+        } = inputs;
+        let began = std::time::Instant::now();
+        let recipe_states = ReadoutRecipeStates::default();
+        let mut spec = Specializer::new(device);
+        let import = imports(&mut spec, plan)?;
+        let owner = AttestedPrograms::owner(device)?;
+        let epsilon = epsilon(tuning.definition)?;
+        let invocations = invocation_demand(
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            selection_limits,
+            &graph_demand,
+            epsilon,
+            &recipe_states,
+        )?;
+        let demanded = began.elapsed();
+        let forming = device.programs_formed();
+        let (glue, target, head, shared_head, draft, vision, tuned, unprepared, readout_choices) = {
+            let mut preparation = Preparation::new(
+                plan,
+                tuning.definition,
+                limits,
+                epsilon,
+                recipe_states.clone(),
+                Some(selection_limits),
+                spec,
+                Tuning::Tuner(Tuner::serve(
+                    device,
+                    tuning,
+                    limits,
+                    TuningWeights::new(device, load, tuning.weights, &import),
+                    invocations,
+                    unprepared,
+                )),
+            );
+            preparation.graph_demand = Some(graph_demand);
+            let glue = preparation.walk(plan)?;
+            let Preparation {
+                tuning,
+                target,
+                head,
+                shared_head,
+                draft,
+                vision,
+                readout_choices,
+                ..
+            } = preparation;
+            let tuner = tuning.into_tuner();
+            let unprepared = tuner.unprepared();
+            (
+                glue,
+                target,
+                head,
+                shared_head,
+                draft,
+                vision,
+                tuner.conclude(),
+                unprepared,
+                readout_choices,
+            )
+        };
+        let formed = device.programs_formed();
+        tracing::info!(
+            "programs walked in {:.2} s: imports and launch demand {:.2} s, serving walk {:.2} s, \
+             forming {} programs in {:.2} s of its threads: {} compiled, {} loaded through the \
+             platform's cache in {:.2} s",
+            began.elapsed().as_secs_f64(),
+            demanded.as_secs_f64(),
+            (began.elapsed() - demanded).as_secs_f64(),
+            formed.programs - forming.programs,
+            formed.seconds - forming.seconds,
+            formed.compiles - forming.compiles,
+            formed.platform_loads - forming.platform_loads,
+            formed.platform_load_seconds - forming.platform_load_seconds,
+        );
+        Ok(Self {
+            readout_choices,
+            owner,
+            import,
+            glue,
+            target,
+            head,
+            shared_head,
+            draft,
+            vision,
+            tuned,
+            unprepared,
+        })
+    }
+
+    /// The search: every unit without a stored tuning record is searched on
+    /// the device within the tuning budget and its record published. A count
+    /// walk finds those units and their launches, and the entries without
+    /// tuning parameters; the mandatory phase forms and publishes each
+    /// unit's canonical default and forms those entries; a census walk
+    /// collects the units with optional work, which are then searched
+    /// together within the tuning time left. Each walk's preparation ends
+    /// with its walk: the tuner, which borrows the import kernels, passes on
+    /// to the next. No walk prepares the choices for serving: a load does,
+    /// from the records. Returns every unit's outcome.
+    pub(super) fn search_programs(
+        inputs: PreparationInputs<'_>,
+    ) -> Result<Vec<TunedEntry>, CatalogFailure> {
+        let PreparationInputs {
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            room,
+            selection_limits,
+            graph_demand,
+        } = inputs;
+        let recipe_states = ReadoutRecipeStates::default();
+        // The search imports the weights its units measure through the
+        // import kernels.
+        let import = imports(&mut Specializer::new(device), plan)?;
+        let epsilon = epsilon(tuning.definition)?;
+        let invocations = invocation_demand(
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            selection_limits,
+            &graph_demand,
+            epsilon,
+            &recipe_states,
+        )?;
+        let mut tuner = Tuner::count(
+            device,
+            tuning,
+            limits,
+            TuningWeights::new(device, load, tuning.weights, &import),
+            invocations,
+        )
+        .held_to(room);
+        let mut formed = HashSet::new();
+        // The search runs in rounds on one tuning clock and budget. A round
+        // whose search replaced a choice a dependant was counted at
+        // (`Tuner::stale`) is followed by one that counts it at the
+        // replacement and forms and searches it there; nothing else is
+        // counted again.
+        let searched = loop {
+            // The count also collects every entry without tuning
+            // parameters: the mandatory phase forms them with the units'
+            // canonical programs, so a load after the search forms nothing
+            // the search did not.
+            let (counted, untuned) = {
+                let mut count = Preparation::new(
+                    plan,
+                    tuning.definition,
+                    limits,
+                    epsilon,
+                    recipe_states.clone(),
+                    Some(selection_limits),
+                    Specializer::count_untuned(device, formed),
+                    Tuning::Tuner(tuner),
+                );
+                count.graph_demand = Some(graph_demand.clone());
+                count.walk(plan)?;
+                let Preparation { spec, tuning, .. } = count;
+                (tuning.into_tuner(), spec.into_untuned())
+            };
+            formed = untuned.formed();
+            let censused = {
+                let mut census = Preparation::new(
+                    plan,
+                    tuning.definition,
+                    limits,
+                    epsilon,
+                    recipe_states.clone(),
+                    Some(selection_limits),
+                    Specializer::count(device),
+                    Tuning::Tuner(counted.census(untuned)?),
+                );
+                census.graph_demand = Some(graph_demand.clone());
+                census.walk(plan)?;
+                census.tuning.into_tuner()
+            };
+            let searched = censused.search()?;
+            if !searched.stale() {
+                break searched;
+            }
+            tuner = searched.recount();
+        };
+        // A development survey measures the units it owns in the search's
+        // process, after the search: one more walk that forms nothing and
+        // reads every other unit's published choice. Without an installed
+        // survey there is nothing to measure and no walk.
+        #[cfg(feature = "tuning-survey")]
+        let searched = if !super::tuning::survey::installed() {
+            searched
+        } else {
+            let mut survey = Preparation::new(
+                plan,
+                tuning.definition,
+                limits,
+                epsilon,
+                recipe_states,
+                Some(selection_limits),
+                Specializer::count(device),
+                Tuning::Tuner(searched),
+            );
+            survey.graph_demand = Some(graph_demand);
+            survey.walk(plan)?;
+            survey.tuning.into_tuner()
+        };
+        // The tuner borrows the import kernels: it ends here, before them.
+        let tuned = searched.conclude();
+        Ok(tuned)
+    }
+}
+
+/// The logical calls of every tuned entry, collected by a metadata-only walk
+/// before any tuner reads a record or opens a search: the same operator walk
+/// under the same settings, so every key it records is the key the tuner
+/// looks up. Physical weight provenance is absent from this map's role and
+/// frequency decisions.
+#[allow(clippy::too_many_arguments)]
+fn invocation_demand(
+    device: &Device,
+    plan: &ProgramPlan,
+    load: &ModelLoadPlan,
+    limits: TuningLimits,
+    tuning: TuningContext<'_>,
+    selection_limits: crate::ResourceLimits,
+    graph_demand: &GraphInvocationDemand,
+    epsilon: f32,
+    recipe_states: &ReadoutRecipeStates,
+) -> Result<super::specialization::InvocationDemand, CatalogFailure> {
+    let mut demand = Preparation::new(
+        plan,
+        tuning.definition,
+        limits,
+        epsilon,
+        recipe_states.clone(),
+        Some(selection_limits),
+        Specializer::count(device),
+        Tuning::demand(
+            ModelInputs {
+                definition: tuning.definition,
+                limits,
+                load,
+            },
+            device,
+            super::tuning::Objective::new(graph_demand.terms.clone()),
+        ),
+    );
+    demand.graph_demand = Some(graph_demand.clone());
+    demand.walk(plan)?;
+    Ok(demand.tuning.into_invocations())
+}
+
+/// The requests of the native kernels preparing `plan` on `backend` prepares,
+/// named without a device: the weight-import entries and the entries the
+/// program walk prepares, each once, in walk order.
+pub(crate) fn kernel_requests(
+    backend: BackendName,
+    plan: &ProgramPlan,
+    definition: &ModelDefinition,
+    load: &ModelLoadPlan,
+    limits: TuningLimits,
+) -> Result<Vec<KernelRequest>, CatalogFailure> {
+    let mut spec = Specializer::list(backend);
+    imports(&mut spec, plan)?;
+    let mut listing = Preparation::new(
+        plan,
+        definition,
+        limits,
+        epsilon(definition)?,
+        ReadoutRecipeStates::default(),
+        None,
+        spec,
+        Tuning::Listing(ModelInputs {
+            definition,
+            limits,
+            load,
+        }),
+    );
+    listing.walk(plan)?;
+    let mut seen = HashSet::new();
+    Ok(listing
+        .spec
+        .into_requests()
+        .into_iter()
+        .filter(|request| seen.insert(request.clone()))
+        .collect())
+}
+
+/// Every admitted definition normalizes with one epsilon, which the
+/// readout's final norm states.
+fn epsilon(definition: &ModelDefinition) -> Result<f32, CatalogFailure> {
+    crate::programs::graph::readout::readout_epsilon(&definition.decoder).map_err(|outcome| {
+        CatalogFailure::Preparation {
+            entry: "normalization",
+            bindings: "decoder epsilon".into(),
+            outcome,
+        }
+    })
+}
+
+/// Prepare the weight-import entries of `plan`'s import slots.
+fn imports(
+    spec: &mut Specializer<'_>,
+    plan: &ProgramPlan,
+) -> Result<ImportKernels, CatalogFailure> {
+    let mut import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    for slot in plan.imports() {
+        match *slot {
+            ImportProgramSlot::Dense { source, resident } => {
+                if import.import_dense.contains_key(&(source, resident)) {
+                    continue;
+                }
+                let bindings = dense_binding_name(source, resident);
+                if let Some(kernel) = fixed!(
+                    spec,
+                    import_dense,
+                    bindings,
+                    import_dense::Elements {
+                        E: Element::dense(source),
+                        U: Element::dense(resident),
+                    }
+                ) {
+                    import.import_dense.insert((source, resident), kernel);
+                }
+            }
+            ImportProgramSlot::Repack { source, resident } => {
+                // A resident element with a packing bound makes it with its
+                // own entry after every import into it.
+                if crate::planning::packing_run(resident).is_some()
+                    && !import.packing_bound.contains_key(&resident)
+                {
+                    if let Some(kernel) = fixed!(
+                        spec,
+                        packing_bound,
+                        resident.name().to_owned(),
+                        packing_bound::Elements { W: resident }
+                    ) {
+                        import.packing_bound.insert(resident, kernel);
+                    }
+                }
+                if import.repack_weight.contains_key(&(source, resident)) {
+                    continue;
+                }
+                let bindings = element_binding_name(source, resident);
+                if let Some(kernel) = fixed!(
+                    spec,
+                    repack_weight,
+                    bindings,
+                    repack_weight::Elements {
+                        E: source,
+                        U: resident,
+                    }
+                ) {
+                    import.repack_weight.insert((source, resident), kernel);
+                }
+            }
+        }
+    }
+    Ok(import)
+}
+
+/// The selected-row counts of a reader whose selections are row classes up
+/// to `bound`.
+fn selected_row_classes(bound: usize) -> Vec<u64> {
+    magnitude_batching::row_classes(bound)
+        .into_iter()
+        .map(|rows| rows as u64)
+        .collect()
+}
+
+struct Preparation<'a> {
+    limits: TuningLimits,
+    graph_demand: Option<GraphInvocationDemand>,
+    spec: Specializer<'a>,
+    tuning: Tuning<'a>,
+    recipe_states: ReadoutRecipeStates,
+    selection_limits: Option<crate::ResourceLimits>,
+    readout_choices: Vec<crate::ReadoutClassChoice>,
+    /// Candidate scopes a reader's recipe left packed: no reader of them
+    /// may store them as planes.
+    readout_packed: HashSet<WeightScope>,
+    epsilon: f32,
+    /// Model width: the static dimension of the feature readout.
+    hidden: u64,
+    /// The target's vocabulary: the static dimension of token selection.
+    vocabulary: u64,
+    target: TargetKernels,
+    /// The tuning case of each fused binding's resident decode route: the
+    /// unit a streamed layer's route follows (`Self::bank_route`).
+    resident_routes: HashMap<RoutedBinding, RoutedRouteSharedTuning>,
+    /// The tuning case of each general binding's resident selection: the
+    /// unit a streamed layer's selection follows.
+    resident_selects: HashMap<GeneralRoutedBinding, RoutedSelectTuning>,
+    /// Each fused binding's resident output, which a streamed layer's
+    /// combine with the CPU site follows.
+    resident_outputs: HashMap<RoutedBinding, RoutedOutputTuning>,
+    /// Each general binding's resident down, which a streamed layer's
+    /// combine with the CPU site follows.
+    resident_downs: HashMap<GeneralRoutedBinding, RoutedDownTuning>,
+    head: Option<HeadKernels>,
+    shared_head: Option<SharedHeadKernels>,
+    draft: Option<DraftKernels>,
+    vision: Option<VisionKernels>,
+}
+
+impl<'a> Preparation<'a> {
+    fn new(
+        plan: &ProgramPlan,
+        definition: &ModelDefinition,
+        limits: TuningLimits,
+        epsilon: f32,
+        recipe_states: ReadoutRecipeStates,
+        selection_limits: Option<crate::ResourceLimits>,
+        spec: Specializer<'a>,
+        tuning: Tuning<'a>,
+    ) -> Self {
+        Self {
+            limits,
+            graph_demand: None,
+            spec,
+            tuning,
+            recipe_states,
+            selection_limits,
+            readout_choices: Vec::new(),
+            readout_packed: HashSet::new(),
+            epsilon,
+            hidden: definition.decoder.hidden,
+            vocabulary: definition.decoder.vocabulary,
+            target: TargetKernels::default(),
+            resident_routes: HashMap::new(),
+            resident_selects: HashMap::new(),
+            resident_outputs: HashMap::new(),
+            resident_downs: HashMap::new(),
+            head: plan.head().map(|_| HeadKernels::default()),
+            shared_head: plan.shared_head().map(|_| SharedHeadKernels::default()),
+            draft: plan.draft().map(|_| DraftKernels::default()),
+            vision: plan.vision().map(|_| VisionKernels::default()),
+        }
+    }
+
+    /// Store `scope` as its planes when its head admits them and the
+    /// backend has their kernels (`super::readout`): this reader's
+    /// selections of up to the backend's `certified_rows` run the certified
+    /// levels, its other reads the planes' full pass. `selected_rows` are
+    /// the reader's selection classes. Every reader of a scope reads the one
+    /// form it is stored in.
+    #[allow(clippy::too_many_arguments)]
+    fn qualified_readout(
+        &mut self,
+        scope: WeightScope,
+        norm_scope: WeightScope,
+        norm: Element,
+        activation: Element,
+        prepared: bool,
+        selected_rows: Vec<u64>,
+        canonical: Option<ProjectionKernels>,
+    ) -> Result<Option<ProjectionKernels>, CatalogFailure> {
+        if self
+            .selection_limits
+            .is_none_or(|limits| limits.exported_logits_rows != 0)
+        {
+            return Ok(None);
+        }
+        let Some(device) = self.tuning.device() else {
+            return Ok(None);
+        };
+        let backend = device.backend();
+        if !crate::programs::graph::readout::reads_progressive_heads(backend)
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome,
+            })?
+        {
+            return Ok(None);
+        }
+        let model = self.tuning.model();
+        let Some(rest) = model.load.readout_candidates().iter().find(|plan| {
+            plan.role
+                == magnitude_family_contracts::WeightRole {
+                    scope,
+                    kind: WeightKind::OutputPlane(
+                        magnitude_family_contracts::ProgressivePlane::Rest,
+                    ),
+                }
+        }) else {
+            return Ok(None);
+        };
+        let failure = |outcome| CatalogFailure::Preparation {
+            entry: "readout_recipe",
+            bindings: format!("{scope:?}"),
+            outcome,
+        };
+        let depth = rest
+            .progressive_depth()
+            .expect("a progressive plane has a code depth");
+        let scale_extent = model
+            .scale_extent(scope, WeightKind::Output)
+            .map_err(failure)?;
+        let packed =
+            super::tuning::weight_plan(model.load, scope, WeightKind::Output).map_err(failure)?;
+        let [stored_vocabulary, hidden] = packed.shape[..] else {
+            return Err(failure(format!(
+                "output projection shape {:?} is not a matrix",
+                packed.shape
+            )));
+        };
+        let (parts, norm_extent) = model.readout_form(norm_scope, hidden).map_err(failure)?;
+        let recipe = ReadoutRecipe {
+            norm,
+            activation,
+            vocabulary: stored_vocabulary.min(self.vocabulary),
+            hidden,
+            parts,
+            norm_extent,
+            depth,
+            scale_extent,
+        };
+        // Readers of one scope differ only in their input form, which every
+        // level's domain admits: a scope is planes for all its readers or
+        // for none.
+        let admitted = recipe.admitted(backend)?;
+        let stored = self
+            .readout_choices
+            .iter()
+            .any(|choice| choice.scope == scope);
+        if (admitted && self.readout_packed.contains(&scope)) || (!admitted && stored) {
+            return Err(failure(
+                "readers of one scope disagree on whether its levels admit their recipes".into(),
+            ));
+        }
+        if !admitted {
+            self.readout_packed.insert(scope);
+            return Ok(None);
+        }
+        let [top, levels @ ..] = recipe.digests(device)?;
+        let preparation = self
+            .recipe_states
+            .borrow_mut()
+            .entry(format!(
+                "readout-physical-programs/device={:?}/top={top}/levels={levels:?}",
+                device.tuning_identity(),
+            ))
+            .or_insert_with(|| Rc::new(RefCell::new(None)))
+            .clone();
+        let certified = crate::programs::graph::readout::certified_rows(backend);
+        let rows = selected_rows.into_iter().filter(|&rows| rows <= certified);
+        if let Some(choice) = self.readout_choices.iter_mut().find(|choice| {
+            choice.scope == scope && choice.norm_scope == norm_scope && choice.prepared == prepared
+        }) {
+            choice.rows.extend(rows);
+            choice.rows.sort_unstable();
+            choice.rows.dedup();
+        } else {
+            self.readout_choices.push(crate::ReadoutClassChoice {
+                scope,
+                norm_scope,
+                prepared,
+                rows: rows.collect(),
+            });
+        }
+        // A count or a listing forms no kernels, the canonical projection
+        // among them: the stored form above is all such a pass records.
+        let Some(packed) = canonical else {
+            return Ok(None);
+        };
+        Ok(Some(ProjectionKernels::Qualified {
+            packed: Box::new(packed),
+            progressive: recipe.form_shared(device, &preparation)?,
+        }))
+    }
+
+    /// Prepare every program entry, in a fixed order.
+    fn walk(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            let mut selection = demand.target.clone();
+            if plan.head().is_some() || plan.shared_head().is_some() {
+                selection.add(&demand.head);
+            }
+            self.tuning.set_invocations(selection, true);
+        }
+        let glue = self.glue(plan)?;
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.target.clone(), true);
+        }
+        self.target(plan)?;
+        self.head(plan)?;
+        self.shared_head(plan)?;
+        self.draft(plan)?;
+        self.vision(plan)?;
+        Ok(glue)
+    }
+
+    /// Token selection, the conditioning overlay and the state row copies.
+    fn glue(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
+        let copies = plan.state().copies();
+        let copy = |spec: &mut Specializer<'_>, element: Element, bindings: &'static str| {
+            if !copies.contains(&element) {
+                return Ok(None);
+            }
+            Ok::<_, CatalogFailure>(fixed!(
+                spec,
+                copy_rows,
+                bindings,
+                copy_rows::Elements { A: element }
+            ))
+        };
+        Ok(GlueKernels {
+            shape_rows: self.spec.tuned(
+                &mut self.tuning,
+                &ShapeRowsTuning {
+                    vocabulary: self.vocabulary,
+                },
+            )?,
+            sample_rows: self.spec.tuned(
+                &mut self.tuning,
+                &SampleRowsTuning {
+                    vocabulary: self.vocabulary,
+                },
+            )?,
+            token_confidence: match plan.drafts_with_head() || plan.draft().is_some() {
+                true => fixed!(self.spec, token_confidence, String::new()),
+                false => None,
+            },
+            conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
+            selection_notice: match plan.notices_selection() {
+                true => fixed!(self.spec, selection_notice, "fixed"),
+                false => None,
+            },
+            feature_copy: fixed!(
+                self.spec,
+                feature_copy,
+                "activation",
+                feature_copy::Elements {
+                    A: plan
+                        .head()
+                        .and_then(|head| head.blocks().first())
+                        .map_or(plan.target().embedding().activation, |head| head
+                            .conditioning)
+                }
+            ),
+            copy_rows_f32: copy(&mut self.spec, Element::f32(), "A=f32")?,
+            copy_rows_f16: copy(&mut self.spec, Element::f16(), "A=f16")?,
+            copy_rows_bf16: copy(&mut self.spec, Element::bf16(), "A=bf16")?,
+            copy_rows_u32: copy(&mut self.spec, Element::u32(), "A=u32")?,
+            copy_rows_i32: copy(&mut self.spec, Element::i32(), "A=i32")?,
+        })
+    }
+
+    fn target(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if plan.head().is_some_and(|head| {
+            head.blocks()
+                .iter()
+                .any(|head| head.conditioning == Element::f32())
+        }) {
+            self.target.residual_features = fixed!(
+                self.spec,
+                feature_rows,
+                "residual",
+                feature_rows::Elements { A: Element::f32() }
+            );
+        }
+        let spec = &mut self.spec;
+        let target = plan.target();
+        let b = target.embedding();
+        if let Some(kernel) = spec.fixed(
+            &format!("{b:?}"),
+            &[("D", self.hidden)],
+            embedding_rows::native_entry_with(embedding_rows::Elements {
+                EW: b.table,
+                A: b.activation,
+            }),
+        )? {
+            self.target.embedding.insert(b, kernel);
+        }
+        // The decoder blocks of a draft head reading target history are
+        // prepared with the target's, by binding: their layers are the
+        // head's.
+        let head_blocks = plan
+            .shared_head()
+            .map_or(&[][..], |head| head.blocks.as_slice());
+        let mut mixer_demand = HashMap::new();
+        let mut feed_demand = HashMap::new();
+        if let Some(demand) = &self.graph_demand {
+            for (blocks, calls) in [
+                (target.blocks(), &demand.target),
+                (head_blocks, &demand.head),
+            ] {
+                for block in blocks {
+                    mixer_demand
+                        .entry(block.mixer())
+                        .or_insert_with(InvocationCounts::default)
+                        .add(calls);
+                    if let Some(feed) = block.feed_forward() {
+                        feed_demand
+                            .entry(feed)
+                            .or_insert_with(InvocationCounts::default)
+                            .add(calls);
+                    }
+                }
+            }
+        }
+        let attention_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (block, sublayer_scope(index, 0)))
+                .chain(
+                    head_blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, block)| (block, head_sublayer_scope(index, 0))),
+                )
+                .filter_map(|(block, scope)| match block.mixer() {
+                    MixerProgramSlot::Attention(binding) => Some((binding, scope)),
+                    _ => None,
+                }),
+        );
+        let recurrent_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::Recurrent(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
+            },
+        ));
+        let state_space_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::StateSpace(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
+            },
+        ));
+        let short_conv_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.mixer() {
+                MixerProgramSlot::ShortConv(binding) => Some((binding, sublayer_scope(index, 0))),
+                _ => None,
+            },
+        ));
+        let dense_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (block, sublayer_scope(index, 1)))
+                .chain(
+                    head_blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, block)| (block, head_sublayer_scope(index, 1))),
+                )
+                .filter_map(|(block, scope)| match block.feed_forward()? {
+                    FeedForwardProgramSlot::Dense(binding) => Some((binding, scope)),
+                    FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::GeneralRouted(_)
+                    | FeedForwardProgramSlot::Parallel(_) => None,
+                }),
+        );
+        let routed_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.feed_forward()? {
+                FeedForwardProgramSlot::Routed(binding) => {
+                    Some((binding, sublayer_scope(index, 1)))
+                }
+                FeedForwardProgramSlot::Dense(_)
+                | FeedForwardProgramSlot::GeneralRouted(_)
+                | FeedForwardProgramSlot::Parallel(_) => None,
+            },
+        ));
+        let general_routed_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| match block.feed_forward()? {
+                    FeedForwardProgramSlot::GeneralRouted(binding) => {
+                        Some((binding, sublayer_scope(index, 1)))
+                    }
+                    FeedForwardProgramSlot::Dense(_)
+                    | FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::Parallel(_) => None,
+                }),
+        );
+        let parallel_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
+            |(index, block)| match block.feed_forward()? {
+                FeedForwardProgramSlot::Parallel(binding) => {
+                    Some((binding, sublayer_scope(index, 1)))
+                }
+                FeedForwardProgramSlot::Dense(_)
+                | FeedForwardProgramSlot::Routed(_)
+                | FeedForwardProgramSlot::GeneralRouted(_) => None,
+            },
+        ));
+        // Each binding is walked once: its case binds every layer it serves,
+        // and a walk that tunes nothing (the count, the census) must not
+        // meet it again at each of them, or its launches per step would be
+        // counted once per layer.
+        let mut mixers = HashSet::new();
+        let mut feeds = HashSet::new();
+        for block in target.blocks().iter().chain(head_blocks) {
+            if let Some(calls) = mixer_demand.get(&block.mixer()) {
+                self.tuning.set_invocations(calls.clone(), false);
+            }
+            match Some(block.mixer()).filter(|slot| mixers.insert(*slot)) {
+                Some(MixerProgramSlot::Attention(b)) if !self.target.attention.contains_key(&b) => {
+                    if let Some(kernels) = self.attention(b, attention_layers.scopes(b))? {
+                        self.target.attention.insert(b, kernels);
+                    }
+                }
+                Some(MixerProgramSlot::Recurrent(b)) if !self.target.recurrent.contains_key(&b) => {
+                    if let Some(kernels) = self.recurrent(b, recurrent_layers.scopes(b))? {
+                        self.target.recurrent.insert(b, kernels);
+                    }
+                }
+                Some(MixerProgramSlot::StateSpace(b))
+                    if !self.target.state_space.contains_key(&b) =>
+                {
+                    if let Some(kernels) = self.state_space(b, state_space_layers.scopes(b))? {
+                        self.target.state_space.insert(b, kernels);
+                    }
+                }
+                Some(MixerProgramSlot::ShortConv(b))
+                    if !self.target.short_conv.contains_key(&b) =>
+                {
+                    if let Some(kernels) = self.short_conv(b, short_conv_layers.scopes(b))? {
+                        self.target.short_conv.insert(b, kernels);
+                    }
+                }
+                Some(
+                    MixerProgramSlot::Attention(_)
+                    | MixerProgramSlot::Recurrent(_)
+                    | MixerProgramSlot::StateSpace(_)
+                    | MixerProgramSlot::ShortConv(_),
+                )
+                | None => {}
+            }
+            if let Some(calls) = block.feed_forward().and_then(|feed| feed_demand.get(&feed)) {
+                self.tuning.set_invocations(calls.clone(), false);
+            }
+            match block.feed_forward().filter(|slot| feeds.insert(*slot)) {
+                Some(FeedForwardProgramSlot::Dense(b)) if !self.target.dense.contains_key(&b) => {
+                    if let Some(kernels) = self.dense(b, dense_layers.scopes(b))? {
+                        self.target.dense.insert(b, kernels);
+                    }
+                }
+                Some(FeedForwardProgramSlot::Routed(b)) if !self.target.routed.contains_key(&b) => {
+                    if let Some(kernels) = self.routed(b, routed_layers.scopes(b))? {
+                        self.target.routed.insert(b, kernels);
+                    }
+                }
+                Some(FeedForwardProgramSlot::GeneralRouted(b))
+                    if !self.target.general_routed.contains_key(&b) =>
+                {
+                    if let Some(kernels) =
+                        self.general_routed(b, general_routed_layers.scopes(b))?
+                    {
+                        self.target.general_routed.insert(b, kernels);
+                    }
+                }
+                Some(FeedForwardProgramSlot::Parallel(b))
+                    if !self.target.parallel.contains_key(&b) =>
+                {
+                    if let Some(kernels) = self.parallel(b, parallel_layers.scopes(b))? {
+                        self.target.parallel.insert(b, kernels);
+                    }
+                }
+                Some(
+                    FeedForwardProgramSlot::Dense(_)
+                    | FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::GeneralRouted(_)
+                    | FeedForwardProgramSlot::Parallel(_),
+                )
+                | None => {}
+            }
+        }
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.target.clone(), true);
+        }
+        let per_layer_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| Some((block.per_layer()?, sublayer_scope(index, 2)))),
+        );
+        let mut per_layers = HashSet::new();
+        for b in target.blocks().iter().filter_map(|block| block.per_layer()) {
+            if per_layers.insert(b) && !self.target.per_layer.contains_key(&b) {
+                if let Some(kernels) = self.per_layer(b, per_layer_layers.scopes(b))? {
+                    self.target.per_layer.insert(b, kernels);
+                }
+            }
+        }
+        if let Some(b) = target.per_layer() {
+            if let Some(kernels) = self.per_layer_entry(b)? {
+                self.target.per_layer_entry.insert(b, kernels);
+            }
+        }
+        let ngram_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| Some((block.ngram()?, sublayer_scope(index, 2)))),
+        );
+        let mut ngrams = HashSet::new();
+        for b in target.blocks().iter().filter_map(|block| block.ngram()) {
+            if ngrams.insert(b) && !self.target.ngram.contains_key(&b) {
+                if let Some(kernels) = self.ngram(b, ngram_layers.scopes(b))? {
+                    self.target.ngram.insert(b, kernels);
+                }
+            }
+        }
+        // Each streamed binding's layers, as its bank names them: a block's
+        // feed-forward, or its parallel block's routed branch.
+        let model = self.tuning.model();
+        let streamed = target
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| Some((block.bank()?, sublayer_scope(index, 1))))
+            .map(|(binding, scope)| {
+                let (_, layer) = model
+                    .load
+                    .expert_bank()
+                    .and_then(|bank| bank.feed_forward(scope))
+                    .ok_or_else(|| CatalogFailure::Preparation {
+                        entry: "routed_bank",
+                        bindings: format!("{binding:?}"),
+                        outcome: format!("the load's bank streams no layer of {scope:?}"),
+                    })?;
+                Ok((binding, layer.scope))
+            })
+            .collect::<Result<Vec<_>, CatalogFailure>>()?;
+        let banks = ordered_layers(streamed);
+        for (binding, layers) in banks {
+            if !self.target.banks.contains_key(&binding) {
+                if let Some(kernels) = self.bank(binding.0, binding.1, &layers)? {
+                    self.target.banks.insert(binding, kernels);
+                }
+            }
+        }
+        let mut sites = Vec::new();
+        let mut sinkhorn = Vec::new();
+        for (index, block) in target.blocks().iter().enumerate() {
+            match block.block_streams() {
+                None => {}
+                Some(BlockStreams::LowRank(binding)) => sites.extend(binding.entries().scoped([
+                    sublayer_scope(index, 0),
+                    sublayer_scope(index, 1),
+                    WeightScope::Target,
+                ])),
+                Some(BlockStreams::Sinkhorn(binding)) => sinkhorn.push(binding),
+            }
+        }
+        let mut streams = std::mem::take(&mut self.target.streams);
+        self.streams(&mut streams, &sites, &sinkhorn)?;
+        self.target.streams = streams;
+        let b = target.readout();
+        let bindings = format!("{b:?}");
+        let features = self.target_features(&bindings, b.norm, b.activation)?;
+        let head = match b.head {
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
+                let head = self.spec.tuned(
+                    &mut self.tuning,
+                    &HeadRowsTuning {
+                        projection_scope: WeightScope::Target,
+                        norm_scope: WeightScope::Target,
+                        norm: b.norm,
+                        weight,
+                        activation: b.activation,
+                        epsilon: self.epsilon,
+                        rows: None,
+                    },
+                )?;
+                let selected = self.spec.tuned(
+                    &mut self.tuning,
+                    &SelectedRowsTuning {
+                        norm: b.norm,
+                        weight,
+                        activation: b.activation,
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                head.zip(selected)
+                    .map(|(head, selected)| ReadoutHeadKernels::Packed { head, selected })
+            }
+        };
+        let qualified = self.qualified_readout(
+            WeightScope::Target,
+            WeightScope::Target,
+            b.norm,
+            b.activation,
+            false,
+            selected_row_classes(
+                self.selection_limits
+                    .map_or(0, |limits| limits.max_selected_rows),
+            ),
+            head.as_ref().map(|head| match head {
+                ReadoutHeadKernels::Packed { head, .. } => {
+                    ProjectionKernels::RawPacked(head.clone())
+                }
+                _ => unreachable!("ordinary target readout is canonical packed"),
+            }),
+        )?;
+        let head = match (head, qualified) {
+            (
+                Some(ReadoutHeadKernels::Packed { head, selected }),
+                Some(ProjectionKernels::Qualified { progressive, .. }),
+            ) => Some(ReadoutHeadKernels::Qualified {
+                packed: Box::new(ReadoutHeadKernels::Packed { head, selected }),
+                progressive,
+            }),
+            (head, _) => head,
+        };
+        if let (Some(features), Some(head)) = (features, head) {
+            self.target
+                .readout
+                .insert(b, ReadoutKernels { features, head });
+        }
+        if let Some(b) = target.features() {
+            if let Some(kernel) = self.target_features(&format!("{b:?}"), b.norm, b.activation)? {
+                self.target.features.insert(b, kernel);
+            }
+        }
+        if let Some(taps) = target.taps() {
+            self.taps(taps)?;
+        }
+        Ok(())
+    }
+
+    /// A separate draft's target taps: the tap, the fusion projection of the
+    /// taps (`project_rows` into F32) and the conditioning feature rows.
+    fn taps(&mut self, taps: &crate::TapProgramPlan) -> Result<(), CatalogFailure> {
+        let activation = taps.activation;
+        let bindings = format!("A={}", activation.name());
+        let tap = fixed!(
+            self.spec,
+            tap_rows,
+            bindings,
+            tap_rows::Elements { A: activation }
+        );
+        let fusion = self.spec.tuned(
+            &mut self.tuning,
+            &ProjectRowsTuning {
+                weight: taps.fusion,
+                activation,
+                kind: WeightKind::DraftFusion,
+                groups: 1,
+                output: Element::f32(),
+                scopes: vec![WeightScope::Draft],
+            },
+        )?;
+        let features = fixed!(
+            self.spec,
+            feature_rows,
+            bindings,
+            feature_rows::Elements { A: activation }
+        );
+        if let (Some(tap), Some(fusion), Some(features)) = (tap, fusion, features) {
+            self.target.taps = Some(TapKernels {
+                tap,
+                fusion,
+                features,
+            });
+        }
+        Ok(())
+    }
+
+    /// `readout_features_rows` over the target decoder's exit: the exit
+    /// site's partial rows, or the final row under the output norm.
+    fn target_features(
+        &mut self,
+        bindings: &str,
+        norm: Element,
+        activation: Element,
+    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
+        let form = self
+            .tuning
+            .model()
+            .readout_form(WeightScope::Target, self.hidden)
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "readout_features_rows",
+                bindings: bindings.into(),
+                outcome,
+            })?;
+        self.features_at(bindings, norm, activation, self.hidden, form)
+    }
+
+    /// `readout_features_rows` over rows `width` wide in the input form
+    /// `(parts, norm extent)`.
+    fn features_at(
+        &mut self,
+        bindings: &str,
+        norm: Element,
+        activation: Element,
+        width: u64,
+        (parts, norm_extent): (u64, u64),
+    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
+        self.spec.fixed(
+            bindings,
+            &[("D", width), ("PT", parts), ("NM", norm_extent)],
+            readout_features_rows::native_entry_with(readout_features_rows::Elements {
+                NW: norm,
+                A: activation,
+            }),
+        )
+    }
+
+    fn attention(
+        &mut self,
+        binding: AttentionBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<AttentionKernels>, CatalogFailure> {
+        let AttentionBinding {
+            shape,
+            activation,
+            output,
+            ..
+        } = binding;
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &AttentionProjectTuning {
+                binding,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        // A low-rank query's widening and up projection, tuned over the
+        // layers' `up` weights.
+        let low_rank_query = match binding.low_rank_query {
+            None => Some(None),
+            Some(low_rank) => {
+                let widen = fixed!(
+                    self.spec,
+                    widen_rows,
+                    format!("A={}", activation.name()),
+                    widen_rows::Elements { A: activation }
+                );
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &LowRankQueryProjectTuning {
+                        binding,
+                        low_rank,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                widen
+                    .zip(project)
+                    .map(|(widen, project)| Some(LowRankQueryKernels { widen, project }))
+            }
+        };
+        let picked = self.picked(binding, &scopes)?;
+        let window = history_window(&self.tuning.model(), &scopes).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "attention_decode",
+                bindings: format!("{shape:?}"),
+                outcome,
+            }
+        })?;
+        let index_list = picked_rows(&self.tuning.model(), &scopes).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "attention_decode",
+                bindings: format!("{shape:?}"),
+                outcome,
+            }
+        })?;
+        let mix = || AttentionMix {
+            codec: binding.history,
+            activation,
+            shape,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+            decode_rows: None,
+            listing: PrefillListing::Every,
+            window,
+            selection: binding.selection,
+            picked: index_list,
+        };
+        // The history's prefill reads every visible row (a selected read's
+        // classes without scoring too); its WorkList form is the selection's.
+        let visible = || AttentionMix {
+            selection: None,
+            ..mix()
+        };
+        let append_statics =
+            crate::operators::attention::graph::append_form_statics(&shape, binding.history)
+                .map_err(|outcome| CatalogFailure::Preparation {
+                    entry: "attention_decode",
+                    bindings: format!("{shape:?}"),
+                    outcome,
+                })?;
+        let history = match binding.history.encoding() {
+            magnitude_state::HistoryEncoding::Dense => {
+                // As for K8/V4, multi-row launches (draft blocks,
+                // verification) get their own tuning identity, so their
+                // grouped form is not displaced by the single-row one. CUDA
+                // also changes history-tile row capacity with its warp count.
+                let split_decode = matches!(
+                    self.spec.backend(),
+                    seismic::BackendName::Metal
+                        | seismic::BackendName::Vulkan
+                        | seismic::BackendName::Cuda
+                ) && self.limits.max_rows >= 2;
+                let decode = if crate::operators::attention::graph::dense_decodes(
+                    self.spec.backend(),
+                    binding,
+                )? {
+                    let mut single = mix();
+                    if split_decode {
+                        single.decode_rows = Some(1..2);
+                    }
+                    let single = self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionDecodeTuning(single))?;
+                    let verify = if split_decode {
+                        let mut selected = mix();
+                        selected.decode_rows =
+                            Some(2..crate::operators::attention::graph::DECODE_ROWS + 1);
+                        self.spec
+                            .tuned(&mut self.tuning, &AttentionDecodeTuning(selected))?
+                    } else {
+                        None
+                    };
+                    single.map(|single| DenseDecodeKernels::Decode { single, verify })
+                } else {
+                    // The prefill entry attends the decode row classes, tuned
+                    // on them alone.
+                    let mut rows = visible();
+                    rows.decode_rows = Some(1..crate::operators::attention::graph::DECODE_ROWS + 1);
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(rows))?
+                        .map(DenseDecodeKernels::Prefill)
+                };
+                let prefill = self
+                    .spec
+                    .tuned(&mut self.tuning, &AttentionPrefillTuning(visible()))?;
+                let append = fixed!(
+                    self.spec,
+                    attention_append_dense,
+                    format!("{shape:?}"),
+                    attention_append_dense::Elements {
+                        A: binding.activation
+                    },
+                    statics & append_statics
+                );
+                decode
+                    .zip(prefill)
+                    .zip(append)
+                    .map(
+                        |((decode, prefill), append)| AttentionHistoryKernels::Dense {
+                            append,
+                            decode,
+                            prefill,
+                        },
+                    )
+            }
+            magnitude_state::HistoryEncoding::Affine => {
+                let split_decode = matches!(
+                    self.spec.backend(),
+                    seismic::BackendName::Metal
+                        | seismic::BackendName::Vulkan
+                        | seismic::BackendName::Cuda
+                ) && self.limits.max_rows >= 2;
+                let mut single = mix();
+                // The base kernel serves only single-row decode when the
+                // graph binds separate verification kernels. Pricing their
+                // rows here as well would duplicate the same served work.
+                if split_decode {
+                    single.decode_rows = Some(1..2);
+                }
+                let decode = self
+                    .spec
+                    .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(single))?;
+                let packed_four_rows = split_decode
+                    && separates_packed_attention_rows(
+                        self.spec.backend(),
+                        shape.group,
+                        shape.width,
+                        self.limits.max_rows,
+                    );
+                let verify = if split_decode {
+                    let mut selected = mix();
+                    selected.decode_rows = Some(
+                        2..if packed_four_rows {
+                            4
+                        } else {
+                            crate::operators::attention::graph::DECODE_ROWS + 1
+                        },
+                    );
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
+                } else {
+                    None
+                };
+                // The packed form reuses each K/V tile across four Verify
+                // rows. Give that workload its own tuning identity so
+                // shorter and wider rows cannot displace its form.
+                let verify_four = if packed_four_rows {
+                    let mut selected = mix();
+                    selected.decode_rows = Some(4..5);
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
+                } else {
+                    None
+                };
+                let verify_eight = if packed_four_rows && self.limits.max_rows >= 5 {
+                    let mut selected = mix();
+                    selected.decode_rows =
+                        Some(5..crate::operators::attention::graph::DECODE_ROWS + 1);
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(selected))?
+                } else {
+                    None
+                };
+                // Where the entry's forms differ by it, a launch that lists
+                // the history row tiles its rows see and one that does not
+                // are two kernels with their own admissible forms.
+                // (`StateResourcePlan::lists_history_tiles`, of the opened
+                // device's own fact; graph preparation checks they agree.)
+                let lists = crate::operators::attention::graph::lists_history_tiles(binding)
+                    && crate::planning::reads_decoded_history(
+                        self.spec.backend(),
+                        self.spec.forms_tensor_operations(),
+                        shape.width,
+                    );
+                // A launch whose rows see at most one request's history
+                // lists the tiles they see; the unlisted kernel serves the
+                // others, or every launch where nothing lists.
+                let capacity = super::tuning::request_history_rows(
+                    &self.tuning.model(),
+                    magnitude_state::KvCodec::AffineK8V4,
+                    window,
+                )
+                .map_err(|outcome| CatalogFailure::Preparation {
+                    entry: "attention_prefill_k8v4",
+                    bindings: format!("{shape:?}"),
+                    outcome,
+                })?;
+                let mut unlisted = visible();
+                if lists {
+                    unlisted.listing = PrefillListing::Unlisted { capacity };
+                }
+                let prefill = self
+                    .spec
+                    .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(unlisted))?;
+                let prefill_listed = if lists {
+                    let mut listed = visible();
+                    listed.listing = PrefillListing::Listed { capacity };
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(listed))?
+                } else {
+                    None
+                };
+                let append = fixed!(
+                    self.spec,
+                    attention_append_k8v4,
+                    format!("{shape:?};codec={:?}", binding.history),
+                    attention_append_k8v4::Elements {
+                        A: binding.activation
+                    },
+                    statics & append_statics
+                );
+                decode
+                    .zip(prefill)
+                    .zip(append)
+                    .map(
+                        |((decode, prefill), append)| AttentionHistoryKernels::AffineK8V4 {
+                            append,
+                            decode,
+                            verify,
+                            verify_four,
+                            verify_eight,
+                            prefill,
+                            prefill_listed,
+                        },
+                    )
+            }
+            magnitude_state::HistoryEncoding::Unsupported => {
+                unreachable!("the attention form refuses a rotated K4/V4 history")
+            }
+        };
+        // A selected read's indexer: its projection, tuned over the layers'
+        // indexer weights, and its selection at the attention's rotary.
+        let selection = match binding.selection {
+            None => Some(None),
+            Some(selection) => {
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &IndexerProjectTuning {
+                        binding,
+                        selection,
+                        scopes: scopes.clone(),
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                let select = fixed!(
+                    self.spec,
+                    indexer_select,
+                    format!("{selection:?};P={}", shape.rotary_pairs),
+                    indexer_select::Elements {
+                        A: binding.activation
+                    },
+                    statics
+                        & [
+                            ("H", selection.shape.heads),
+                            ("P", shape.rotary_pairs),
+                            ("S", selection.shape.width - 2 * shape.rotary_pairs),
+                            ("SB", selection.shape.block),
+                        ]
+                );
+                let prefill = match binding.history.encoding() {
+                    magnitude_state::HistoryEncoding::Affine => self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?
+                        .map(SelectedPrefillKernel::AffineK8V4),
+                    _ => self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?
+                        .map(SelectedPrefillKernel::Dense),
+                };
+                match (project, select, prefill) {
+                    (Some(project), Some(select), Some(prefill)) => Some(Some(SelectionKernels {
+                        project,
+                        select,
+                        prefill,
+                    })),
+                    _ => None,
+                }
+            }
+        };
+        // A grouped output's first product publishes the activation rows the
+        // output projection reads.
+        let grouped = match binding.grouped {
+            None => Some(None),
+            Some(grouped) => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &ProjectRowsTuning {
+                        weight: grouped.element,
+                        activation,
+                        kind: WeightKind::AttentionOutputGrouped,
+                        groups: grouped.shape.groups,
+                        output: activation,
+                        scopes: scopes.clone(),
+                    },
+                )?
+                .map(Some),
+        };
+        let output = match binding.tail {
+            SublayerTail::Residual => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &AttentionOutputTuning {
+                        output,
+                        activation,
+                        shape,
+                        input: binding.output_input(),
+                        scopes,
+                    },
+                )?
+                .map(SublayerOutput::Residual),
+            SublayerTail::PostNorm { norm, .. } => self
+                .post_norm(
+                    WeightKind::AttentionOutput,
+                    output,
+                    activation,
+                    norm,
+                    scopes,
+                )?
+                .map(SublayerOutput::PostNorm),
+        };
+        Ok(match (project, history, output, grouped, selection, low_rank_query, picked) {
+            (
+                Some(project),
+                Some(history),
+                Some(output),
+                Some(grouped),
+                Some(selection),
+                Some(low_rank_query),
+                Some(picked),
+            ) => {
+                Some(AttentionKernels {
+                    codec: binding.history,
+                    project,
+                    history,
+                    output,
+                    grouped,
+                    selection,
+                    low_rank_query,
+                    picked,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// An indexing index-list source's entries (`PickedKernels`): an own
+    /// source's `u | g` and index-key projections, its indexer's query and
+    /// head-weight projections, each tuned over the layers' weights at the
+    /// elements `PickedElements` assigns, and the widening, pooling, keys,
+    /// scores, picks and candidate pool at their statics. `Some(None)` for a
+    /// binding without an indexing source.
+    fn picked(
+        &mut self,
+        binding: AttentionBinding,
+        scopes: &[WeightScope],
+    ) -> Result<Option<Option<PickedKernels>>, CatalogFailure> {
+        let Some(elements) = crate::operators::attention::pooled::PickedElements::of(binding) else {
+            return Ok(Some(None));
+        };
+        let index = elements.indexer;
+        let shape = binding.shape;
+        let activation = binding.activation;
+        let project = |this: &mut Self, elements, segments, input| {
+            this.spec.tuned(
+                &mut this.tuning,
+                &PooledProjectTuning {
+                    elements,
+                    segments,
+                    input,
+                    scopes: scopes.to_vec(),
+                    epsilon: this.epsilon,
+                },
+            )
+        };
+        let hidden = PooledProjectInput::Hidden { hidden: shape.hidden };
+        let pairs = shape.rotary_pairs;
+        let rotary = [("RA", shape.rotary_adjacent), ("RT", shape.rotary_trailing)];
+        // An own source's rows and keys.
+        let rows = match (binding.picked, elements.rows) {
+            (Some(crate::PickedBinding::Own(pooled)), Some(rows)) => {
+                let gate = pooled.gate.map(|_| WeightKind::PooledGate);
+                let tokens = project(
+                    self,
+                    rows.project,
+                    [Some(WeightKind::PooledProjection), gate],
+                    hidden,
+                )?;
+                let key_project = project(
+                    self,
+                    rows.key_project,
+                    [Some(WeightKind::IndexerKey), None],
+                    match rows.pooling {
+                        Pooling::Grouped => PooledProjectInput::Plain { width: shape.width },
+                        Pooling::Identity => PooledProjectInput::Tokens { width: shape.width },
+                    },
+                )?;
+                let widen = fixed!(
+                    self.spec,
+                    widen_rows,
+                    format!("A={}", activation.name()),
+                    widen_rows::Elements { A: activation }
+                );
+                let width = [("P", pairs), ("S", shape.width - 2 * pairs)];
+                let pool = match rows.pooling {
+                    Pooling::Identity => fixed!(
+                        self.spec,
+                        attention_append_dense,
+                        format!("{pooled:?};{shape:?}"),
+                        attention_append_dense::Elements { A: activation },
+                        statics
+                            & [width.as_slice(), &Pooling::identity_append(pooled.rounding), &rotary].concat()
+                    )
+                    .map(PoolKernel::Identity),
+                    Pooling::Grouped => fixed!(
+                        self.spec,
+                        pool_rows,
+                        format!("{pooled:?};{shape:?}"),
+                        pool_rows::Elements { A: activation },
+                        statics
+                            & [
+                                width.as_slice(),
+                                &[("GT", pooled.gt()), ("RATE", pooled.rate)],
+                                &rotary,
+                            ]
+                            .concat()
+                    )
+                    .map(PoolKernel::Grouped),
+                };
+                let keys = fixed!(
+                    self.spec,
+                    indexer_keys,
+                    format!("{index:?};P={pairs}"),
+                    indexer_keys::Elements { A: activation },
+                    statics & [[("P", pairs), ("S", index.width - 2 * pairs)].as_slice(), &rotary].concat()
+                );
+                match (tokens, widen, pool, key_project, keys) {
+                    (Some(project), Some(widen), Some(pool), Some(key_project), Some(keys)) => {
+                        Some(Some(PooledKernels {
+                            project,
+                            widen,
+                            pool,
+                            key_project,
+                            keys,
+                        }))
+                    }
+                    _ => None,
+                }
+            }
+            (Some(crate::PickedBinding::Reindex { .. }), None) => Some(None),
+            (picked, rows) => unreachable!(
+                "PickedElements::of gives an own source rows and a reindexing source none: \
+                 {picked:?} with rows {rows:?}"
+            ),
+        };
+        let query_project = project(
+            self,
+            elements.query_project,
+            [Some(WeightKind::IndexerQuery), None],
+            PooledProjectInput::QueryRank { rank: elements.query_rank },
+        )?;
+        let weights_project = match elements.weights_project {
+            None => Some(None),
+            Some(elements) => project(
+                self,
+                elements,
+                [Some(WeightKind::IndexerHeadWeights), None],
+                hidden,
+            )?
+            .map(Some),
+        };
+        let score = fixed!(
+            self.spec,
+            indexer_score,
+            format!("{index:?};P={pairs}"),
+            indexer_score::Elements { A: activation },
+            statics
+                & [
+                    [
+                        ("H", index.heads),
+                        ("P", pairs),
+                        ("S", index.width - 2 * pairs),
+                        ("NQ", index.query_norm),
+                        ("HW", if index.head_weights.is_some() { index.heads } else { 0 }),
+                    ]
+                    .as_slice(),
+                    &rotary,
+                ]
+                .concat()
+        );
+        let topk = fixed!(self.spec, rows_topk, format!("{index:?}"));
+        // A producing indexer's candidate pool.
+        let candidates = match index.candidates {
+            crate::CandidatesBinding::Produce(pool) => {
+                let blocks = fixed!(self.spec, candidate_blocks, format!("{pool:?}"));
+                let listed = fixed!(self.spec, candidate_rows, format!("{pool:?}"));
+                blocks
+                    .zip(listed)
+                    .map(|(blocks, rows)| Some(CandidateKernels { blocks, rows }))
+            }
+            crate::CandidatesBinding::All | crate::CandidatesBinding::Restrict(_) => Some(None),
+        };
+        Ok(
+            match (rows, query_project, weights_project, score, topk, candidates) {
+                (
+                    Some(rows),
+                    Some(query_project),
+                    Some(weights_project),
+                    Some(score),
+                    Some(topk),
+                    Some(candidates),
+                ) => Some(Some(PickedKernels {
+                    rows,
+                    indexer: IndexerKernels {
+                        query_project,
+                        weights_project,
+                        score,
+                        topk,
+                        candidates,
+                    },
+                })),
+                _ => None,
+            },
+        )
+    }
+
+    /// The state-space entries (`operators::state_space`): the projection and
+    /// output reuse the attention projection entries at this geometry.
+    fn state_space(
+        &mut self,
+        binding: StateSpaceBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<StateSpaceKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &StateSpaceProjectTuning {
+                binding,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let state = || StateSpaceState {
+            activation: binding.activation,
+            shape: binding.shape,
+            scopes: scopes.clone(),
+        };
+        let step = self
+            .spec
+            .tuned(&mut self.tuning, &StateSpaceStepTuning(state()))?;
+        let chunk = self
+            .spec
+            .tuned(&mut self.tuning, &StateSpaceChunkTuning(state()))?;
+        let shape = binding.shape;
+        let gate = fixed!(
+            self.spec,
+            state_space_gate,
+            format!("{binding:?}"),
+            state_space_gate::Elements {
+                A: binding.activation
+            },
+            statics
+                & [
+                    ("G", shape.norm_groups()),
+                    ("U", shape.norm_heads),
+                    ("P", shape.head_width)
+                ]
+        );
+        let output = self.spec.tuned(
+            &mut self.tuning,
+            &StateSpaceOutputTuning { binding, scopes },
+        )?;
+        Ok(match (project, step, chunk, gate, output) {
+            (Some(project), Some(step), Some(chunk), Some(gate), Some(output)) => {
+                Some(StateSpaceKernels {
+                    project,
+                    step,
+                    chunk,
+                    gate,
+                    output,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The short-convolution entries (`operators::short_conv`): the output
+    /// reuses the attention output entry at one head of `channels`.
+    fn short_conv(
+        &mut self,
+        binding: ShortConvBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<ShortConvKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &ShortConvProjectTuning {
+                binding,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let rows = fixed!(
+            self.spec,
+            short_conv_rows,
+            format!("{binding:?}"),
+            short_conv_rows::Elements {
+                A: binding.activation
+            }
+        );
+        let output = match binding.tail {
+            SublayerTail::Residual => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &ShortConvOutputTuning {
+                        binding,
+                        scopes,
+                    },
+                )?
+                .map(SublayerOutput::Residual),
+            SublayerTail::PostNorm { norm, .. } => self
+                .post_norm(
+                    WeightKind::RecurrentOutput,
+                    binding.output,
+                    binding.activation,
+                    norm,
+                    scopes,
+                )?
+                .map(SublayerOutput::PostNorm),
+        };
+        Ok(match (project, rows, output) {
+            (Some(project), Some(rows), Some(output)) => Some(ShortConvKernels {
+                project,
+                rows,
+                output,
+            }),
+            _ => None,
+        })
+    }
+
+    fn recurrent(
+        &mut self,
+        b: RecurrentBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<RecurrentKernels>, CatalogFailure> {
+        let shape = RecurrentShape {
+            key_heads: b.key_heads,
+            value_heads: b.value_heads,
+            width: b.width,
+            convolution_width: b.convolution_width,
+            scopes,
+        };
+        let state = || RecurrentState {
+            recurrent_norm: b.recurrent_norm,
+            activation: b.activation,
+            shape: shape.clone(),
+            epsilon: self.epsilon,
+        };
+        let form =
+            StepForm::of(self.spec.backend()).map_err(|outcome| CatalogFailure::Preparation {
+                entry: "gated_delta_step_convolved",
+                bindings: format!("{b:?}"),
+                outcome,
+            })?;
+        let project_tuning = || RecurrentProjectTuning {
+            norm: b.norm,
+            qkv: b.qkv,
+            gate: b.gate,
+            alpha: b.alpha,
+            beta: b.beta,
+            activation: b.activation,
+            shape: shape.clone(),
+            epsilon: self.epsilon,
+        };
+        let step = match form {
+            StepForm::Step => self
+                .spec
+                .tuned(&mut self.tuning, &RecurrentStepTuning(state()))?
+                .map(RecurrentStepKernels::Step),
+            StepForm::Convolved => {
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &RecurrentProjectConvolvedTuning(project_tuning()),
+                )?;
+                let step = self
+                    .spec
+                    .tuned(&mut self.tuning, &RecurrentStepConvolvedTuning(state()))?;
+                project
+                    .zip(step)
+                    .map(|(project, step)| RecurrentStepKernels::Convolved { project, step })
+            }
+        };
+        let chunk = self
+            .spec
+            .tuned(&mut self.tuning, &RecurrentChunkTuning(state()))?;
+        let project = self.spec.tuned(&mut self.tuning, &project_tuning())?;
+        let output = self.spec.tuned(
+            &mut self.tuning,
+            &RecurrentOutputTuning {
+                output: b.output,
+                activation: b.activation,
+                shape,
+            },
+        )?;
+        Ok(match (project, step, chunk, output) {
+            (Some(project), Some(step), Some(chunk), Some(output)) => Some(RecurrentKernels {
+                project,
+                step,
+                chunk,
+                output,
+            }),
+            _ => None,
+        })
+    }
+
+    fn dense(
+        &mut self,
+        binding: DenseBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<DenseKernels>, CatalogFailure> {
+        let DenseBinding {
+            features: _,
+            norm,
+            gate,
+            up,
+            down,
+            activation,
+            function,
+            limit,
+            tail,
+            // The tunings read their scale ports' extents from the plan.
+            scales: _,
+        } = binding;
+        let expand = self.spec.tuned(
+            &mut self.tuning,
+            &DenseExpandTuning {
+                norm,
+                gate,
+                up,
+                activation,
+                gate_kind: WeightKind::DenseGate,
+                up_kind: WeightKind::DenseUp,
+                function,
+                limit,
+                scopes: scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let output = match tail {
+            SublayerTail::Residual => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &DenseOutputTuning {
+                        down,
+                        activation,
+                        down_kind: WeightKind::DenseDown,
+                        scopes,
+                    },
+                )?
+                .map(SublayerOutput::Residual),
+            SublayerTail::PostNorm { norm, .. } => self
+                .post_norm(WeightKind::DenseDown, down, activation, norm, scopes)?
+                .map(SublayerOutput::PostNorm),
+        };
+        Ok(match (expand, output) {
+            (Some(expand), Some(output)) => Some(DenseKernels { expand, output }),
+            _ => None,
+        })
+    }
+
+    /// A per-layer input sublayer: its gate, then the post-norm tail of its
+    /// projection back to the hidden width.
+    fn per_layer(
+        &mut self,
+        binding: crate::PerLayerBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<PerLayerKernels>, CatalogFailure> {
+        let SublayerTail::PostNorm { norm, .. } = binding.tail else {
+            return Err(CatalogFailure::Preparation {
+                entry: "per_layer_gate",
+                bindings: format!("{binding:?}"),
+                outcome: "a per-layer input sublayer ends in a post-norm tail".into(),
+            });
+        };
+        let gate = self.spec.tuned(
+            &mut self.tuning,
+            &super::tuning::per_layer::PerLayerGateTuning {
+                binding,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let output = self.post_norm(
+            WeightKind::PerLayerProjection,
+            binding.projection,
+            binding.activation,
+            norm,
+            scopes,
+        )?;
+        Ok(gate
+            .zip(output)
+            .map(|(gate, output)| PerLayerKernels { gate, output }))
+    }
+
+    /// An n-gram input sublayer; `scopes` are its sublayers' scopes.
+    fn ngram(
+        &mut self,
+        binding: crate::NGramBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<NGramKernels>, CatalogFailure> {
+        let projection = |kind| ProjectRowsTuning {
+            weight: match kind {
+                WeightKind::NGramKey => binding.key,
+                _ => binding.value,
+            },
+            activation: binding.activation,
+            kind,
+            groups: 1,
+            output: Element::f32(),
+            scopes: scopes.clone(),
+        };
+        let key = self
+            .spec
+            .tuned(&mut self.tuning, &projection(WeightKind::NGramKey))?;
+        let value = self
+            .spec
+            .tuned(&mut self.tuning, &projection(WeightKind::NGramValue))?;
+        let rows = self.spec.fixed(
+            "fixed",
+            &binding.rule.statics(),
+            ngram_rows::native_entry(),
+        )?;
+        let stored = self.spec.fixed(
+            &format!(
+                "E={},A={}",
+                binding.table.name(),
+                binding.activation.name()
+            ),
+            &[("W", binding.width)],
+            stored_rows::native_entry_with(stored_rows::Elements {
+                E: binding.table,
+                A: binding.activation,
+            }),
+        )?;
+        let norm = format!("NW={}", binding.norm.name());
+        let gate = self.spec.fixed(
+            &norm,
+            &[
+                ("H", binding.hidden),
+                ("S", binding.streams),
+                ("PR", binding.gate.product()),
+            ],
+            ngram_gate::native_entry_with(ngram_gate::Elements { NW: binding.norm }),
+        )?;
+        let output = match binding.convolution {
+            None => self
+                .spec
+                .fixed(
+                    "fixed",
+                    &[("H", binding.hidden), ("S", binding.streams)],
+                    ngram_add::native_entry(),
+                )?
+                .map(NGramOutputKernel::Add),
+            Some(taps) => self
+                .spec
+                .fixed(
+                    &norm,
+                    &[
+                        ("H", binding.hidden),
+                        ("S", binding.streams),
+                        ("K", taps.kernel),
+                    ],
+                    ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
+                )?
+                .map(NGramOutputKernel::Inject),
+        };
+        Ok(match (rows, stored, key, value, gate, output) {
+            (Some(rows), Some(stored), Some(key), Some(value), Some(gate), Some(output)) => {
+                Some(NGramKernels {
+                    rows,
+                    stored,
+                    key,
+                    value,
+                    gate,
+                    output,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The hyper-connection streams entries of mix sites `sites` (each
+    /// site's entry bindings at its scope) that `prepared` lacks: each
+    /// distinct `stream_mix_down` and `stream_mix_up` binding prepared once,
+    /// tuned over every site that binds it in site order; the Sinkhorn
+    /// entries of each distinct block binding `sinkhorn`, untuned; and the
+    /// widening of the embedded rows.
+    fn streams(
+        &mut self,
+        prepared: &mut StreamsEntryKernels,
+        sites: &[(SiteEntryBindings, WeightScope)],
+        sinkhorn: &[SinkhornBinding],
+    ) -> Result<(), CatalogFailure> {
+        if sites.is_empty() && sinkhorn.is_empty() {
+            return Ok(());
+        }
+        for &binding in sinkhorn {
+            if prepared.sinkhorn.contains_key(&binding) {
+                continue;
+            }
+            let SinkhornBinding { hidden, streams, .. } = binding;
+            let label = format!("H={hidden} S={streams}");
+            let spec = &mut self.spec;
+            let site = spec.fixed(&label, &[("H", hidden), ("S", streams)], stream_mix_sinkhorn::native_entry())?;
+            let collapse = spec.fixed(&label, &[("H", hidden), ("S", streams)], stream_collapse::native_entry())?;
+            let join = spec.fixed(
+                &label,
+                &[("H", hidden), ("SN", streams), ("IN", streams + streams * streams)],
+                stream_join::native_entry(),
+            )?;
+            if let (Some(site), Some(collapse), Some(join)) = (site, collapse, join) {
+                prepared.sinkhorn.insert(binding, SinkhornKernels { site, collapse, join });
+            }
+        }
+        let downs = ordered_layers(sites.iter().map(|(site, scope)| (site.down, *scope)));
+        for (binding, scopes) in downs {
+            if prepared.down.contains_key(&binding) {
+                continue;
+            }
+            let kernel = self.spec.tuned(
+                &mut self.tuning,
+                &StreamMixDownTuning {
+                    binding,
+                    scopes,
+                    epsilon: self.epsilon,
+                },
+            )?;
+            if let Some(kernel) = kernel {
+                prepared.down.insert(binding, kernel);
+            }
+        }
+        let ups = ordered_layers(sites.iter().map(|(site, scope)| (site.up, *scope)));
+        for (binding, scopes) in ups {
+            if prepared.up.contains_key(&binding) {
+                continue;
+            }
+            let kernel = self
+                .spec
+                .tuned(&mut self.tuning, &StreamMixUpTuning { binding, scopes })?;
+            if let Some(kernel) = kernel {
+                prepared.up.insert(binding, kernel);
+            }
+        }
+        if prepared.repeat.is_none() {
+            let spec = &mut self.spec;
+            prepared.repeat = fixed!(spec, repeat_rows, "fixed");
+        }
+        Ok(())
+    }
+
+    /// The per-layer entry: the embedding's projection into F32 per-layer
+    /// channels and their combination with the host-table rows.
+    fn per_layer_entry(
+        &mut self,
+        binding: crate::PerLayerEntryBinding,
+    ) -> Result<Option<PerLayerEntryKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &ProjectRowsTuning {
+                weight: binding.projection,
+                activation: binding.activation,
+                kind: WeightKind::PerLayerModelProjection,
+                groups: 1,
+                output: Element::f32(),
+                scopes: vec![WeightScope::Target],
+            },
+        )?;
+        let spec = &mut self.spec;
+        let activation = binding
+            .activation
+            .dtype()
+            .ok_or_else(|| CatalogFailure::Preparation {
+                entry: "import_dense",
+                bindings: format!("{binding:?}"),
+                outcome: "the activation element is not dense".into(),
+            })?;
+        let round = fixed!(
+            spec,
+            import_dense,
+            dense_binding_name(seismic::DType::F32, activation),
+            import_dense::Elements {
+                E: Element::f32(),
+                U: binding.activation,
+            }
+        );
+        let table = match (binding.table_source.dtype(), binding.table.dtype()) {
+            (Some(source), Some(resident)) => fixed!(
+                spec,
+                import_dense,
+                dense_binding_name(source, resident),
+                import_dense::Elements {
+                    E: binding.table_source,
+                    U: binding.table,
+                }
+            )
+            .map(TableConversion::Dense),
+            _ => fixed!(
+                spec,
+                repack_weight,
+                element_binding_name(binding.table_source, binding.table),
+                repack_weight::Elements {
+                    E: binding.table_source,
+                    U: binding.table,
+                }
+            )
+            .map(TableConversion::Repack),
+        };
+        let copy = fixed!(spec, conditioning_overlay, "fixed");
+        let inputs = self.spec.fixed(
+            &format!("TW={},NW={}", binding.table.name(), binding.norm.name()),
+            &[("L", binding.layers), ("P", binding.width)],
+            per_layer_inputs::native_entry_with(per_layer_inputs::Elements {
+                TW: binding.table,
+                NW: binding.norm,
+            }),
+        )?;
+        Ok(match (round, project, table, inputs, copy) {
+            (Some(round), Some(project), Some(table), Some(inputs), Some(copy)) => {
+                Some(PerLayerEntryKernels {
+                    round,
+                    project,
+                    table,
+                    inputs,
+                    copy,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// A dense branch beside a routed branch; `scopes` are the parallel
+    /// sublayers' scopes, whose branches hold the weights.
+    fn parallel(
+        &mut self,
+        binding: crate::ParallelBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<ParallelKernels>, CatalogFailure> {
+        let branch_scopes = |branch: usize| {
+            scopes
+                .iter()
+                .map(|scope| match *scope {
+                    WeightScope::TargetSublayer(sublayer) => {
+                        Ok(crate::operators::parallel::DenseBesideRouted::scopes(sublayer)[branch])
+                    }
+                    other => Err(CatalogFailure::Preparation {
+                        entry: "moe_tail",
+                        bindings: format!("{binding:?}"),
+                        outcome: format!("parallel branches in {other:?}"),
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let (dense_scopes, routed_scopes) = (branch_scopes(0)?, branch_scopes(1)?);
+        let dense = binding.dense;
+        let expand = self.spec.tuned(
+            &mut self.tuning,
+            &DenseExpandTuning {
+                norm: dense.norm,
+                gate: dense.gate,
+                up: dense.up,
+                activation: dense.activation,
+                gate_kind: WeightKind::DenseGate,
+                up_kind: WeightKind::DenseUp,
+                function: dense.function,
+                limit: dense.limit,
+                scopes: dense_scopes.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let down = self.spec.tuned(
+            &mut self.tuning,
+            &ProjectRowsTuning {
+                weight: dense.down,
+                activation: dense.activation,
+                kind: WeightKind::DenseDown,
+                groups: 1,
+                output: Element::f32(),
+                scopes: dense_scopes,
+            },
+        )?;
+        let routed = self.general_routed(binding.routed, routed_scopes)?;
+        let tail = fixed!(
+            self.spec,
+            moe_tail,
+            format!("NW={}", binding.norm.name()),
+            moe_tail::Elements { NW: binding.norm }
+        );
+        Ok(match (expand, down, routed, tail) {
+            (Some(expand), Some(down), Some(routed), Some(tail)) => Some(ParallelKernels {
+                expand,
+                down,
+                routed,
+                tail,
+            }),
+            _ => None,
+        })
+    }
+
+    /// A post-norm tail: the output projection `kind` into F32 rows, then the
+    /// row op that normalizes them into the residual.
+    fn post_norm(
+        &mut self,
+        kind: WeightKind,
+        weight: Element,
+        activation: Element,
+        norm: Element,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<PostNormKernels>, CatalogFailure> {
+        let project = self.spec.tuned(
+            &mut self.tuning,
+            &ProjectRowsTuning {
+                weight,
+                activation,
+                kind,
+                groups: 1,
+                output: Element::f32(),
+                scopes,
+            },
+        )?;
+        let residual = fixed!(
+            self.spec,
+            post_norm_residual,
+            format!("NW={}", norm.name()),
+            post_norm_residual::Elements { NW: norm }
+        );
+        Ok(project
+            .zip(residual)
+            .map(|(project, residual)| PostNormKernels { project, residual }))
+    }
+
+    /// The general routed entries (`operators::routed`), with the shared
+    /// expert and latent projections as dense entries over their own weight
+    /// kinds.
+    fn general_routed(
+        &mut self,
+        binding: GeneralRoutedBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<GeneralRoutedKernels>, CatalogFailure> {
+        let shape = binding.shape;
+        let activation = binding.activation;
+        let epsilon = self.epsilon;
+        let resident_select = RoutedSelectTuning {
+            binding,
+            scopes: scopes.clone(),
+            epsilon,
+        };
+        let select = self.spec.tuned(&mut self.tuning, &resident_select)?;
+        self.resident_selects.insert(binding, resident_select);
+        let decode = || RoutedExpandDecodeTuning {
+            binding,
+            scopes: scopes.clone(),
+        };
+        let tiles = || RoutedExpertTilesTuning {
+            binding,
+            scopes: scopes.clone(),
+        };
+        let experts = if shape.experts_expansion.gated {
+            let decode = self
+                .spec
+                .tuned(&mut self.tuning, &RoutedGateUpTuning(decode()))?;
+            let grouped = self
+                .spec
+                .tuned(&mut self.tuning, &RoutedGatedTilesTuning(tiles()))?;
+            decode
+                .zip(grouped)
+                .map(|(decode, grouped)| ExpertKernels::Gated { decode, grouped })
+        } else {
+            let decode = self
+                .spec
+                .tuned(&mut self.tuning, &RoutedUpTuning(decode()))?;
+            let grouped = self
+                .spec
+                .tuned(&mut self.tuning, &RoutedUpTilesTuning(tiles()))?;
+            decode
+                .zip(grouped)
+                .map(|(decode, grouped)| ExpertKernels::Plain { decode, grouped })
+        };
+        let resident_down = RoutedDownTuning {
+            binding,
+            scopes: scopes.clone(),
+        };
+        let down = self.spec.tuned(&mut self.tuning, &resident_down)?;
+        self.resident_downs.insert(binding, resident_down);
+        let group = self.spec.tuned(
+            &mut self.tuning,
+            &RoutedGroupTuning {
+                shape: routing_shape(&binding),
+                layers: scopes.len(),
+            },
+        )?;
+        let scatter = self.spec.tuned(
+            &mut self.tuning,
+            &RoutedScatterTuning {
+                binding,
+                layers: scopes.len(),
+            },
+        )?;
+        let shared = match (shape.shared, binding.shared) {
+            (Some((_, expansion)), Some((gate, up, down))) => {
+                let expansion = match gate {
+                    Some(gate) => self
+                        .spec
+                        .tuned(
+                            &mut self.tuning,
+                            &DenseExpandTuning {
+                                norm: binding.norm,
+                                gate,
+                                up,
+                                activation,
+                                gate_kind: WeightKind::SharedGate,
+                                up_kind: WeightKind::SharedUp,
+                                function: expansion.activation,
+                                limit: expansion.limit,
+                                scopes: scopes.clone(),
+                                epsilon,
+                            },
+                        )?
+                        .map(DenseExpansionKernel::Gated),
+                    None => self
+                        .spec
+                        .tuned(
+                            &mut self.tuning,
+                            &DenseUpTuning {
+                                norm: binding.norm,
+                                up,
+                                activation,
+                                up_kind: WeightKind::SharedUp,
+                                function: expansion.activation,
+                                scopes: scopes.clone(),
+                                epsilon,
+                            },
+                        )?
+                        .map(DenseExpansionKernel::Plain),
+                };
+                let output = self.spec.tuned(
+                    &mut self.tuning,
+                    &DenseOutputTuning {
+                        down,
+                        activation,
+                        down_kind: WeightKind::SharedDown,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                Some(expansion.zip(output))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(CatalogFailure::Preparation {
+                    entry: "dense_output",
+                    bindings: format!("{binding:?}"),
+                    outcome: "the shared expert's shape and binding disagree".into(),
+                });
+            }
+        };
+        let latent = match binding.latent {
+            Some((down, up)) => {
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &ProjectRowsTuning {
+                        weight: down,
+                        activation,
+                        kind: WeightKind::LatentDown,
+                        groups: 1,
+                        output: activation,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                let output = self.spec.tuned(
+                    &mut self.tuning,
+                    &DenseOutputTuning {
+                        down: up,
+                        activation,
+                        down_kind: WeightKind::LatentUp,
+                        scopes,
+                    },
+                )?;
+                Some(project.zip(output))
+            }
+            None => None,
+        };
+        // `None` anywhere is a tuning count or a missing implementation.
+        Ok(match (select, experts, down, group, scatter) {
+            (Some(select), Some(experts), Some(down), Some(group), Some(scatter)) => {
+                let shared = match shared {
+                    Some(Some(shared)) => Some(shared),
+                    Some(None) => return Ok(None),
+                    None => None,
+                };
+                let latent = match latent {
+                    Some(Some(latent)) => Some(latent),
+                    Some(None) => return Ok(None),
+                    None => None,
+                };
+                Some(GeneralRoutedKernels {
+                    select,
+                    experts,
+                    down,
+                    group,
+                    scatter,
+                    shared,
+                    latent,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The bank entries of a streamed routed layer of feed-forward `slot`
+    /// (either routed form) whose bank is `bank`, over its streamed `layers`.
+    fn bank(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+    ) -> Result<Option<super::ExpertBankKernels>, CatalogFailure> {
+        use magnitude_kernels::{
+            routed_convert, routed_copy, routed_list_grid, routed_list_stage, routed_move, routed_pass_map, routed_scratch_grids, routed_scratch_request,
+            routed_scratch_wait, routed_seed_commit, routed_step, routed_tier_wait,
+        };
+        let bindings = format!("{slot:?} {bank:?}");
+        let ([experts, selected], route) = self.bank_route(slot, bank, layers, &bindings)?;
+        let spec = &mut self.spec;
+        let crate::planning::RecordTensors { gate, up, down } = bank.record;
+        let tier_wait = spec.fixed(
+            &bindings,
+            &[("K", selected)],
+            routed_tier_wait::native_entry(),
+        )?;
+        let step = spec.fixed(&bindings, &[], routed_step::native_entry())?;
+        let table = bank.words.scratch();
+        let scratch = [("FLIGHT", table.slots()), ("LANES", table.lanes())];
+        // The scratch flags are the widest layer's (`BankPart::ScratchFlags`).
+        let scratch_request = spec.fixed(
+            &bindings,
+            &[&[("K", selected), ("E", bank.widest)], scratch.as_slice()].concat(),
+            routed_scratch_request::native_entry(),
+        )?;
+        // An up-only record's gate conveyor is empty, in its up's stored
+        // element.
+        let scratch_wait = spec.fixed(
+            &bindings,
+            &scratch,
+            routed_scratch_wait::native_entry_with(routed_scratch_wait::Elements {
+                SG: gate.map_or(up.source, |gate| gate.source),
+                SU: up.source,
+                SD: down.source,
+            }),
+        )?;
+        let scratch_grids = spec.fixed(
+            &bindings,
+            &[scratch.as_slice(), &[("R", bank.words.rounds)]].concat(),
+            routed_scratch_grids::native_entry(),
+        )?;
+        let list_stage = spec.fixed(&bindings, &[], routed_list_stage::native_entry())?;
+        let pass_map = spec.fixed(&bindings, &[], routed_pass_map::native_entry())?;
+        // The device's placements, only where it places.
+        let places = bank.placer == crate::planning::Placer::Tier;
+        let seed = places
+            .then(|| {
+                bank.record.try_map(|_, tensor| {
+                    let [n, k] = tensor.matrix;
+                    spec.fixed(
+                        &bindings,
+                        &[("S", experts), ("D", bank.records), ("L", bank.widest), ("N", n), ("K", k)],
+                        routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }),
+                    )
+                })
+            })
+            .transpose()?;
+        let convert = bank.record.try_map(|_, tensor| {
+            let [n, k] = tensor.matrix;
+            spec.fixed(
+                &bindings,
+                &[
+                    ("V", bank.conveyor),
+                    ("L", bank.round_records),
+                    ("S", experts),
+                    ("N", n),
+                    ("K", k),
+                ],
+                routed_convert::native_entry_with(routed_convert::Elements {
+                    ST: tensor.source,
+                    U: tensor.resident,
+                }),
+            )
+        })?;
+        let seed_commit = places
+            .then(|| {
+                spec.fixed(
+                    &bindings,
+                    &[&[("X", bank.widest), ("BANK", bank.records)], scratch.as_slice()].concat(),
+                    routed_seed_commit::native_entry(),
+                )
+            })
+            .transpose()?;
+        let list_grid = places.then(|| spec.fixed(&bindings, &[], routed_list_grid::native_entry())).transpose()?;
+        // Each routed tensor's records, whoever places: a shrink's moves run
+        // on the device in queue order.
+        let moves = bank.record.try_map(|_, tensor| {
+            let [n, k] = tensor.matrix;
+            spec.fixed(
+                &bindings,
+                &[("D", bank.records), ("L", bank.moves), ("N", n), ("K", k)],
+                routed_move::native_entry_with(routed_move::Elements { U: tensor.resident }),
+            )
+        })?;
+        let site = self.bank_site(slot, bank, layers, &bindings)?;
+        /// Every tensor's kernel, or none where one is a count or a listing.
+        fn formed<T>(kernels: crate::planning::RecordTensors<Option<T>>) -> Option<crate::planning::RecordTensors<T>> {
+            kernels.try_map(|_, kernel| kernel.ok_or(())).ok()
+        }
+        // `None` anywhere: a count or a listing, which forms nothing.
+        let (
+            Some(route),
+            Some(tier_wait),
+            Some(step),
+            Some(scratch_request),
+            Some(scratch_wait),
+            Some(scratch_grids),
+            Some(list_stage),
+            Some(pass_map),
+        ) = (route, tier_wait, step, scratch_request, scratch_wait, scratch_grids, list_stage, pass_map)
+        else {
+            return Ok(None);
+        };
+        let (Some(convert), Some(moves)) = (formed(convert), formed(moves)) else {
+            return Ok(None);
+        };
+        let placement = match (seed, seed_commit, list_grid) {
+            (Some(seed), Some(seed_commit), Some(list_grid)) => {
+                let (Some(seed), Some(seed_commit), Some(list_grid)) = (formed(seed), seed_commit, list_grid) else {
+                    return Ok(None);
+                };
+                Some(super::DevicePlacement { seed, seed_commit, list_grid })
+            }
+            _ => None,
+        };
+        let site = match site {
+            Some(None) => return Ok(None),
+            site => site.flatten(),
+        };
+        Ok(Some(super::ExpertBankKernels {
+            route,
+            tier_wait,
+            step,
+            scratch_request,
+            scratch_wait,
+            scratch_grids,
+            list_stage,
+            pass_map,
+            convert,
+            placement,
+            moves: super::BankMoves { records: moves },
+            site,
+        }))
+    }
+
+    /// The CPU site entries of a streamed layer of feed-forward `slot` whose
+    /// bank is `bank`, over its streamed `layers`: none where the bank has
+    /// no host tier or the backend serves none of the site's entries
+    /// (`routed_site_request` and the combine of the layer's form);
+    /// `Some(None)` where one is a count or a listing. The combine's
+    /// projections follow the binding's resident combine
+    /// (`Specializer::tuned_following`), so they keep that combine's bits; its
+    /// sum has no parameter.
+    fn bank_site(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+        bindings: &str,
+    ) -> Result<Option<Option<super::BankSite>>, CatalogFailure> {
+        use crate::planning::BankedFeedForward;
+        use magnitude_kernels::{routed_down_sited, routed_output_sited, routed_site_request};
+        let failure = |entry: &'static str, outcome: String| CatalogFailure::Preparation {
+            entry,
+            bindings: bindings.to_owned(),
+            outcome,
+        };
+        if !super::BankSite::served(slot, bank, self.spec.backend()).map_err(|outcome| failure("routed_bank_site", outcome))? {
+            return Ok(None);
+        }
+        let form = super::SiteForm::of(slot);
+        let (hidden, combine) = match slot {
+            BankedFeedForward::Routed(b) => {
+                let resident = self.resident_outputs.get(&b).cloned().ok_or_else(|| {
+                    failure("routed_output_project", "a streamed layer's output was not prepared before it".into())
+                })?;
+                let case = RoutedOutputProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
+                let project = self.spec.tuned_following(&mut self.tuning, &case, &resident)?;
+                let (streams, inject) =
+                    self.tuning.model().join(layers).map_err(|outcome| failure("routed_output_sited", outcome))?;
+                let sited = self.spec.fixed(
+                    bindings,
+                    &[("H", b.hidden), ("SN", streams), ("IN", inject), ("K", bank.selected)],
+                    routed_output_sited::native_entry_with(routed_output_sited::Elements { A: b.activation }),
+                )?;
+                let combine = project.zip(sited).map(|(project, sited)| super::BankCombine::Fused { project, sited });
+                (b.hidden, combine)
+            }
+            BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                let resident = self.resident_downs.get(&b).cloned().ok_or_else(|| {
+                    failure("routed_down_project", "a streamed layer's down was not prepared before it".into())
+                })?;
+                let case = RoutedDownProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
+                let project = self.spec.tuned_following(&mut self.tuning, &case, &resident)?;
+                let sited = self.spec.fixed(
+                    bindings,
+                    &[("H", b.shape.expert_hidden), ("K", bank.selected)],
+                    routed_down_sited::native_entry_with(routed_down_sited::Elements {
+                        A: b.activation,
+                        R: crate::operators::routed::graph::sum_element(&b),
+                    }),
+                )?;
+                let combine = project.zip(sited).map(|(project, sited)| super::BankCombine::General { project, sited });
+                (b.shape.expert_hidden, combine)
+            }
+        };
+        let request = self.spec.fixed(
+            bindings,
+            &[("H", hidden), ("K", bank.selected)],
+            routed_site_request::native_entry_with(routed_site_request::Elements { A: form.activation }),
+        )?;
+        Ok(Some(request.zip(combine).map(|(request, combine)| super::BankSite { request, combine, form, admitted: None })))
+    }
+
+    /// The extents of a streamed layer of feed-forward `slot` (H, E, K, F:
+    /// H its records' width, a latent operator's own), and its decode route
+    /// and resolve by `AHEAD` (without hints, the last streamed layer; then
+    /// at each count of leads, `ExpertBankPlan::ahead`) in that form, over
+    /// its streamed `layers`.
+    /// Each is a unit of its own that follows its resident decode entry of
+    /// this binding (`Specializer::tuned_following`): at that entry's
+    /// arithmetic choice, so its bits, and tuned in its launch shape over
+    /// the layers that launch it at its `AHEAD`; none at an `AHEAD` none of
+    /// `layers` launches.
+    fn bank_route(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+        bindings: &str,
+    ) -> Result<([u64; 2], Option<super::BankRouteKernels>), CatalogFailure> {
+        use crate::planning::BankedFeedForward;
+        let failure = |entry, outcome| CatalogFailure::Preparation {
+            entry,
+            bindings: bindings.to_owned(),
+            outcome,
+        };
+        // The layers of each `AHEAD`: the last streamed layer, at 0, then
+        // each layer at the leads its route has (`ExpertBankPlan::ahead`). A
+        // binding need not hold every one (its layers are those of its
+        // weights' forms): an `AHEAD` none of its layers launches has no
+        // kernel.
+        let model = self.tuning.model();
+        let mut leads: [Vec<WeightScope>; super::LEADS] = Default::default();
+        let plan = model.load.expert_bank().ok_or_else(|| failure("routed_bank", "a streamed layer's load holds no bank".into()))?;
+        for &scope in layers {
+            let (index, _) = plan
+                .layer(scope)
+                .ok_or_else(|| failure("routed_bank", format!("{scope:?} is not a streamed layer")))?;
+            leads[plan.ahead(index) as usize].push(scope);
+        }
+        match slot {
+            BankedFeedForward::Routed(b) => {
+                let entry = "routed_route_streamed";
+                let resident = self.resident_routes.get(&b).cloned().ok_or_else(|| {
+                    failure(entry, "a streamed layer's decode needs the shared-route form".into())
+                })?;
+                let mut ahead = 0;
+                let routes = leads.map(|layers| {
+                    let lead = ahead;
+                    ahead += 1;
+                    (!layers.is_empty()).then(|| {
+                        let case = RoutedRouteStreamedTuning {
+                            resident: resident.clone(),
+                            layers,
+                            bank,
+                            ahead: lead,
+                        };
+                        self.spec.tuned_following(&mut self.tuning, &case, &resident)
+                    })
+                });
+                Ok((
+                    [b.experts, b.selected],
+                    each_lead(routes)?.map(super::BankRouteKernels::Fused),
+                ))
+            }
+            // A parallel block's routed branch is general: its selection is
+            // the branch's.
+            BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                let entry = "routed_select_streamed";
+                let resident = self.resident_selects.get(&b).cloned().ok_or_else(|| {
+                    failure(entry, "a streamed layer's selection was not prepared before it".into())
+                })?;
+                let mut ahead = 0;
+                let selects = leads.map(|layers| {
+                    let lead = ahead;
+                    ahead += 1;
+                    (!layers.is_empty()).then(|| {
+                        let case = RoutedSelectStreamedTuning {
+                            resident: resident.clone(),
+                            layers,
+                            bank,
+                            ahead: lead,
+                        };
+                        self.spec.tuned_following(&mut self.tuning, &case, &resident)
+                    })
+                });
+                Ok((
+                    [b.shape.experts, b.shape.selected],
+                    each_lead(selects)?.map(super::BankRouteKernels::General),
+                ))
+            }
+        }
+    }
+
+    fn routed(
+        &mut self,
+        b: RoutedBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<RoutedKernels>, CatalogFailure> {
+        let shape = RoutedShape {
+            hidden: b.hidden,
+            experts: b.experts,
+            selected: b.selected,
+            features: b.features,
+            shared: b.shared,
+        };
+        let form =
+            DecodeForm::of(self.spec.backend()).map_err(|outcome| CatalogFailure::Preparation {
+                entry: "routed_route_shared",
+                bindings: format!("{b:?}"),
+                outcome,
+            })?;
+        let route_tuning = RoutedRouteTuning {
+            norm: b.norm,
+            router: b.router,
+            activation: b.activation,
+            shape,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+            decode: form == DecodeForm::Expand,
+        };
+        let route = self.spec.tuned(&mut self.tuning, &route_tuning)?;
+        let group = self.spec.tuned(
+            &mut self.tuning,
+            &RoutedGroupTuning {
+                shape,
+                layers: scopes.len(),
+            },
+        )?;
+        let decode = match form {
+            DecodeForm::Expand => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &RoutedExpandTuning {
+                        expert_gate: b.expert_gate,
+                        expert_up: b.expert_up,
+                        shared_gate: b.shared_gate,
+                        shared_up: b.shared_up,
+                        activation: b.activation,
+                        shape,
+                        scopes: scopes.clone(),
+                    },
+                )?
+                .map(RoutedDecodeKernels::Expand),
+            DecodeForm::SharedRoute => {
+                let shared_route = RoutedRouteSharedTuning {
+                    route: route_tuning,
+                    shared_gate: b.shared_gate,
+                    shared_up: b.shared_up,
+                };
+                let route = self.spec.tuned(&mut self.tuning, &shared_route)?;
+                self.resident_routes.insert(b, shared_route);
+                let choices = self.spec.tuned(
+                    &mut self.tuning,
+                    &RoutedChoicesTuning {
+                        expert_gate: b.expert_gate,
+                        expert_up: b.expert_up,
+                        activation: b.activation,
+                        shape,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                route
+                    .zip(choices)
+                    .map(|(route, choices)| RoutedDecodeKernels::SharedRoute { route, choices })
+            }
+        };
+        let resident_output = RoutedOutputTuning {
+            expert_down: b.expert_down,
+            shared_down: b.shared_down,
+            activation: b.activation,
+            shape,
+            scopes: scopes.clone(),
+        };
+        let output = self.spec.tuned(&mut self.tuning, &resident_output)?;
+        self.resident_outputs.insert(b, resident_output);
+        let experts = self.spec.tuned(
+            &mut self.tuning,
+            &RoutedExpertsTuning {
+                expert_gate: b.expert_gate,
+                expert_up: b.expert_up,
+                expert_down: b.expert_down,
+                activation: b.activation,
+                shape,
+                scopes: scopes.clone(),
+            },
+        )?;
+        let combine = self.spec.tuned(
+            &mut self.tuning,
+            &RoutedCombineTuning {
+                shared_gate: b.shared_gate,
+                shared_up: b.shared_up,
+                shared_down: b.shared_down,
+                activation: b.activation,
+                shape,
+                scopes,
+            },
+        )?;
+        Ok(match (route, decode, output, group, experts, combine) {
+            (
+                Some(route),
+                Some(decode),
+                Some(output),
+                Some(group),
+                Some(experts),
+                Some(combine),
+            ) => Some(RoutedKernels {
+                route,
+                decode,
+                output,
+                group,
+                experts,
+                combine,
+            }),
+            _ => None,
+        })
+    }
+
+    fn head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            let mut calls = demand.head.clone();
+            calls.add(&demand.head_prefix);
+            self.tuning.set_invocations(calls, true);
+        }
+        let Some(head_plan) = plan.head() else {
+            return Ok(());
+        };
+        let scoped = |scope: fn(usize) -> WeightScope| {
+            BindingLayers::of(
+                head_plan
+                    .blocks()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, binding)| (*binding, scope(index))),
+            )
+        };
+        let layers = scoped(head_scope);
+        let attention_layers = scoped(|index| head_sublayer_scope(index, 0));
+        let feed_forward_layers = scoped(|index| head_sublayer_scope(index, 1));
+        let mut registered = HashSet::new();
+        for (head_index, &b) in head_plan.blocks().iter().enumerate() {
+            if !registered.insert(b)
+                || self
+                    .head
+                    .as_ref()
+                    .is_some_and(|head| head.input.contains_key(&b))
+            {
+                continue;
+            }
+            if let Some(demand) = &self.graph_demand {
+                let mut calls = demand.head.clone();
+                calls.add(&demand.head_prefix);
+                self.tuning.set_invocations(calls, true);
+            }
+            let bindings = format!("{b:?}");
+            let stream_kernels = match b.streams {
+                Some(streams) => {
+                    let mut prepared = StreamsEntryKernels::default();
+                    let sites = streams
+                        .entries()
+                        .scoped([
+                            head_sublayer_scope(head_index, 0),
+                            head_sublayer_scope(head_index, 1),
+                            head_scope(head_index),
+                        ])
+                        .collect::<Vec<_>>();
+                    self.streams(&mut prepared, &sites, &[])?;
+                    prepared.kernels(BlockStreams::LowRank(streams))
+                }
+                None => None,
+            };
+            let copy = fixed!(
+                self.spec,
+                feature_copy,
+                &bindings,
+                feature_copy::Elements { A: b.conditioning }
+            );
+            let gather = fixed!(
+                self.spec,
+                feature_rows,
+                &bindings,
+                feature_rows::Elements { A: b.conditioning }
+            );
+            let input = self.spec.tuned(
+                &mut self.tuning,
+                &DraftRowsTuning {
+                    conditioning: b.conditioning,
+                    streams: b.streams.map_or(1, |s| s.geometry.streams),
+                    embedding: b.embedding_table,
+                    embedding_norm: b.embedding_norm,
+                    hidden_norm: b.hidden_norm,
+                    combine: b.combine,
+                    activation: b.activation,
+                    scopes: layers.scopes(b),
+                    epsilon: self.epsilon,
+                },
+            )?;
+            // Priming injects K/V only: it does not run attention or FFN.
+            if let Some(demand) = &self.graph_demand {
+                self.tuning.set_invocations(demand.head.clone(), true);
+            }
+            // The draft head's history is always dense (its binding says so).
+            let attention = self.attention(b.attention, attention_layers.scopes(b))?;
+            if let Some(demand) = &self.graph_demand {
+                self.tuning
+                    .set_invocations(demand.head_prefix.clone(), true);
+            }
+            let priming_project = self.spec.tuned(
+                &mut self.tuning,
+                &AttentionProjectTuning {
+                    binding: AttentionBinding {
+                        key_value_only: true,
+                        ..b.attention
+                    },
+                    scopes: attention_layers.scopes(b),
+                    epsilon: self.epsilon,
+                },
+            )?;
+            if let Some(demand) = &self.graph_demand {
+                self.tuning.set_invocations(demand.head.clone(), true);
+            }
+            let feed_forward = match b.feed_forward {
+                FeedForwardProgramSlot::Dense(binding) => self
+                    .dense(binding, feed_forward_layers.scopes(b))?
+                    .map(AttestedFeedForward::Dense),
+                FeedForwardProgramSlot::Routed(binding) => self
+                    .routed(binding, feed_forward_layers.scopes(b))?
+                    .map(AttestedFeedForward::Routed),
+                // `operators::admit` keeps draft heads on the fused form.
+                FeedForwardProgramSlot::GeneralRouted(_) | FeedForwardProgramSlot::Parallel(_) => {
+                    return Err(CatalogFailure::Preparation {
+                        entry: "routed_select",
+                        bindings: format!("{b:?}"),
+                        outcome: "draft heads run the fused routed form only".into(),
+                    });
+                }
+            };
+            if let Some(demand) = &self.graph_demand {
+                let mut calls = InvocationCounts::default();
+                for _ in &layers.scopes(b) {
+                    calls.add(&demand.head);
+                }
+                self.tuning.set_invocations(calls, false);
+            }
+            let form = b
+                .streams
+                .map_or((1, self.hidden), |streams| (streams.geometry.streams, 0));
+            let features =
+                self.features_at(&bindings, b.output_norm, b.activation, self.hidden, form)?;
+            let logits = match b.projection {
+                ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
+                    .spec
+                    .tuned(
+                        &mut self.tuning,
+                        &PreparedProjectionTuning {
+                            scope: WeightScope::Target,
+                            kind: WeightKind::Output,
+                            weight,
+                            activation: b.activation,
+                            columns: None,
+                            indexed: false,
+                            softcap: 0.0,
+                        },
+                    )?
+                    .map(ProjectionKernels::PreparedPacked),
+            };
+            let qualified = self.qualified_readout(
+                WeightScope::Target,
+                head_scope(head_index),
+                b.output_norm,
+                b.activation,
+                true,
+                selected_row_classes(self.selection_limits.map_or(0, |limits| {
+                    limits.max_launch_slots.min(limits.max_launch_rows)
+                })),
+                logits.clone(),
+            )?;
+            let logits = qualified.or(logits);
+            let head = self
+                .head
+                .as_mut()
+                .expect("a head plan creates the head group");
+            if let (
+                Some(input),
+                Some(attention),
+                Some(priming_project),
+                Some(feed_forward),
+                Some(features),
+                Some(logits),
+            ) = (
+                input,
+                attention,
+                priming_project,
+                feed_forward,
+                features,
+                logits,
+            ) {
+                if let Some(streams) = stream_kernels {
+                    head.streams.insert(b, streams);
+                }
+                if let Some(copy) = copy {
+                    head.copy.insert(b, copy);
+                }
+                if let Some(gather) = gather {
+                    head.gather.insert(b, gather);
+                }
+                head.input.insert(b, input);
+                head.attention.insert(b, attention);
+                head.priming_project.insert(b, priming_project);
+                match feed_forward {
+                    AttestedFeedForward::Dense(dense) => {
+                        head.dense.insert(b, dense);
+                    }
+                    AttestedFeedForward::Routed(routed) => {
+                        head.routed.insert(b, routed);
+                    }
+                    AttestedFeedForward::GeneralRouted(_) | AttestedFeedForward::Parallel(_) => {
+                        return Err(CatalogFailure::Preparation {
+                            entry: "routed_select",
+                            bindings: format!("{b:?}"),
+                            outcome: "draft heads run the fused routed form only".into(),
+                        });
+                    }
+                }
+                head.features.insert(b, features);
+                head.logits.insert(b, logits);
+            }
+        }
+        // Token selection over the draft vocabulary.
+        let vocabulary = self.vocabulary;
+        let shape = self
+            .spec
+            .tuned(&mut self.tuning, &ShapeRowsTuning { vocabulary })?;
+        let sample = self
+            .spec
+            .tuned(&mut self.tuning, &SampleRowsTuning { vocabulary })?;
+        let head = self
+            .head
+            .as_mut()
+            .expect("a head plan creates the head group");
+        head.shape = shape;
+        head.sample = sample;
+        Ok(())
+    }
+
+    /// A draft head reading target history, apart from its decoder blocks
+    /// (prepared with the target's): the join of its input halves, the
+    /// projections into and out of its width, its normalized output and its
+    /// own vocabulary table.
+    fn shared_head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.head.clone(), true);
+        }
+        let Some(head) = plan.shared_head() else {
+            return Ok(());
+        };
+        let activation = head.activation;
+        let scopes = vec![head_scope(0)];
+        let bindings = format!("A={}", activation.name());
+        let join = fixed!(
+            self.spec,
+            tap_rows,
+            bindings,
+            tap_rows::Elements { A: activation }
+        );
+        // Both projections publish F32 rows: the residual the blocks read,
+        // and the hidden row the next step joins.
+        let project = |this: &mut Self, weight: Element, kind: WeightKind| {
+            this.spec.tuned(
+                &mut this.tuning,
+                &ProjectRowsTuning {
+                    weight,
+                    activation,
+                    kind,
+                    groups: 1,
+                    output: Element::f32(),
+                    scopes: scopes.clone(),
+                },
+            )
+        };
+        let input = project(self, head.input.element, WeightKind::HeadInputProjection)?;
+        let chain = project(self, head.chain.element, WeightKind::HeadChainProjection)?;
+        let features = self.features_at(
+            &format!("NW={},A={}", head.output_norm.name(), activation.name()),
+            head.output_norm,
+            activation,
+            head.width,
+            (1, head.width),
+        )?;
+        let compact_columns = head.clustered.as_ref().map(|cluster| {
+            cluster.selected_clusters * (cluster.token_order.len() as u64 / cluster.clusters)
+        });
+        let projection = match head.projection {
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &PreparedProjectionTuning {
+                        scope: head_scope(0),
+                        kind: WeightKind::Output,
+                        weight,
+                        activation,
+                        columns: compact_columns,
+                        indexed: head.clustered.is_some(),
+                        softcap: 0.0,
+                    },
+                )?
+                .map(ProjectionKernels::PreparedPacked),
+        };
+        let qualified = if head.clustered.is_none() {
+            self.qualified_readout(
+                head_scope(0),
+                head_scope(0),
+                head.output_norm,
+                activation,
+                true,
+                selected_row_classes(self.selection_limits.map_or(0, |limits| {
+                    limits
+                        .max_launch_slots
+                        .min(limits.max_launch_rows)
+                        .min(limits.max_drafting_slots)
+                })),
+                projection.clone(),
+            )?
+        } else {
+            None
+        };
+        let projection = qualified.or(projection);
+        let centroids = head
+            .clustered
+            .as_ref()
+            .map(|cluster| {
+                self.spec.tuned(
+                    &mut self.tuning,
+                    &PreparedProjectionTuning {
+                        scope: head_scope(0),
+                        kind: WeightKind::OutputCentroids,
+                        weight: cluster.centroids.element,
+                        activation,
+                        columns: None,
+                        indexed: false,
+                        softcap: 0.0,
+                    },
+                )
+            })
+            .transpose()?
+            .flatten();
+        let (cluster_selection, cluster_rows, placement) = if head.clustered.is_some() {
+            (
+                fixed!(self.spec, draft_top_k, ""),
+                fixed!(self.spec, cluster_token_rows, ""),
+                fixed!(self.spec, place_logits_rows, ""),
+            )
+        } else {
+            (None, None, None)
+        };
+        let kernels = self
+            .shared_head
+            .as_mut()
+            .expect("a shared head plan creates its group");
+        kernels.join = join;
+        kernels.input = input;
+        kernels.features = features;
+        kernels.projection = projection;
+        kernels.centroids = centroids;
+        kernels.cluster_selection = cluster_selection;
+        kernels.cluster_rows = cluster_rows;
+        kernels.placement = placement;
+        kernels.chain = chain;
+        Ok(())
+    }
+
+    /// A separate draft: per distinct binding, its layers' attention (block
+    /// and injection) and dense entries; the block embedding; the output
+    /// norm and projection of the proposing rows; DSpark's chain entries.
+    fn draft(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.draft.clone(), true);
+        }
+        let Some(draft_plan) = plan.draft() else {
+            return Ok(());
+        };
+        let draft_scope = |index: usize, sublayer: u32| {
+            WeightScope::DraftSublayer(SublayerIndex {
+                block: u32::try_from(index).expect("draft block count fits u32"),
+                sublayer,
+            })
+        };
+        let attention_layers = BindingLayers::of(draft_plan.blocks().iter().enumerate().flat_map(
+            |(index, b)| {
+                [
+                    (b.attention, draft_scope(index, 0)),
+                    (b.injection, draft_scope(index, 0)),
+                ]
+            },
+        ));
+        let dense_layers = BindingLayers::of(
+            draft_plan
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, b)| (b.feed_forward, draft_scope(index, 1))),
+        );
+        let mut registered_attention = HashSet::new();
+        let mut registered_dense = HashSet::new();
+        for b in draft_plan.blocks() {
+            for attention in [b.attention, b.injection] {
+                if !registered_attention.insert(attention)
+                    || self.draft_kernels().attention.contains_key(&attention)
+                {
+                    continue;
+                }
+                if let Some(kernels) =
+                    self.attention(attention, attention_layers.scopes(attention))?
+                {
+                    self.draft_kernels().attention.insert(attention, kernels);
+                }
+            }
+            if registered_dense.insert(b.feed_forward)
+                && !self.draft_kernels().dense.contains_key(&b.feed_forward)
+            {
+                if let Some(kernels) =
+                    self.dense(b.feed_forward, dense_layers.scopes(b.feed_forward))?
+                {
+                    self.draft_kernels().dense.insert(b.feed_forward, kernels);
+                }
+            }
+        }
+        let b = draft_plan.embedding();
+        let embedding = self.spec.fixed(
+            &format!("{b:?}"),
+            &[("D", self.hidden)],
+            embedding_rows::native_entry_with(embedding_rows::Elements {
+                EW: b.table,
+                A: b.activation,
+            }),
+        )?;
+        let head = match draft_plan.projection() {
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &HeadRowsTuning {
+                        projection_scope: draft_plan.projection_scope(),
+                        norm_scope: WeightScope::Draft,
+                        norm: draft_plan.output_norm(),
+                        weight,
+                        activation: draft_plan.activation(),
+                        epsilon: self.epsilon,
+                        rows: Some(self.vocabulary),
+                    },
+                )?
+                .map(ProjectionKernels::RawPacked),
+        };
+        // A draft through the target's projection reads it as it is stored:
+        // its planes, through their full pass, when the scope is stored as
+        // them. The draft certifies no class of its own: its proposals'
+        // confidences read every logit.
+        let head = match draft_plan.projection_scope() {
+            WeightScope::Target => self
+                .qualified_readout(
+                    WeightScope::Target,
+                    WeightScope::Draft,
+                    draft_plan.output_norm(),
+                    draft_plan.activation(),
+                    false,
+                    Vec::new(),
+                    head.clone(),
+                )?
+                .or(head),
+            _ => head,
+        };
+        let shape = self.spec.tuned(
+            &mut self.tuning,
+            &ShapeRowsTuning {
+                vocabulary: self.vocabulary,
+            },
+        )?;
+        let sample = self.spec.tuned(
+            &mut self.tuning,
+            &SampleRowsTuning {
+                vocabulary: self.vocabulary,
+            },
+        )?;
+        let widen = fixed!(
+            self.spec,
+            widen_rows,
+            format!("A={}", draft_plan.activation().name()),
+            widen_rows::Elements {
+                A: draft_plan.activation()
+            }
+        );
+        let markov = match draft_plan.markov() {
+            None => None,
+            Some(markov) => {
+                let activation = draft_plan.activation();
+                let bindings = format!("{markov:?}");
+                let rank = markov.rank;
+                let embedding = self.spec.fixed(
+                    &bindings,
+                    &[("D", rank)],
+                    embedding_rows::native_entry_with(embedding_rows::Elements {
+                        EW: markov.embedding,
+                        A: activation,
+                    }),
+                )?;
+                let projection = self.spec.tuned(
+                    &mut self.tuning,
+                    &DenseOutputTuning {
+                        down: markov.projection,
+                        activation,
+                        down_kind: WeightKind::MarkovProjection,
+                        scopes: vec![WeightScope::Draft],
+                    },
+                )?;
+                match (embedding, projection) {
+                    (Some(embedding), Some(projection)) => Some(MarkovKernels {
+                        embedding,
+                        projection,
+                    }),
+                    _ => None,
+                }
+            }
+        };
+        self.draft_stages(draft_plan)?;
+        let draft = self.draft_kernels();
+        draft.embedding = embedding;
+        draft.head = head;
+        draft.shape = shape;
+        draft.sample = sample;
+        draft.widen = widen;
+        draft.markov = markov;
+        Ok(())
+    }
+
+    /// The unfused draft stages: every projection (per kind, weight and
+    /// published element, over every scope sharing it) and norm (per element
+    /// and width) of `super::draft::stage_entries`, then a convolved
+    /// backbone's convolution halves and gated product, DFlash2's top-k,
+    /// codebook gathers and path step, and LiLiCorr's corrector entries.
+    /// Leaves a stage absent during a tuning count.
+    fn draft_stages(&mut self, plan: &crate::DraftProgramPlan) -> Result<(), CatalogFailure> {
+        let activation = plan.activation();
+        let (projections, norm_keys) = super::draft::stage_entries(plan);
+        for ((kind, weight, output), scopes) in projections {
+            if let Some(kernel) = self.spec.tuned(
+                &mut self.tuning,
+                &ProjectRowsTuning {
+                    weight,
+                    activation,
+                    kind,
+                    groups: 1,
+                    output,
+                    scopes,
+                },
+            )? {
+                self.draft_kernels()
+                    .projections
+                    .insert((kind, weight, output), kernel);
+            }
+        }
+        for (norm, width) in norm_keys {
+            if let Some(kernel) = self.features_at(
+                &format!("draft NW={} D={width}", norm.name()),
+                norm,
+                activation,
+                width,
+                (1, width),
+            )? {
+                self.draft_kernels().norms.insert((norm, width), kernel);
+            }
+        }
+        let bindings = format!("A={}", activation.name());
+        if plan.convolutions().is_some() {
+            let convolve_input = fixed!(
+                self.spec,
+                draft_convolve_input,
+                bindings,
+                draft_convolve_input::Elements { A: activation }
+            );
+            let convolve_residual = fixed!(self.spec, draft_convolve_residual, "");
+            let gated = fixed!(
+                self.spec,
+                draft_gated_rows,
+                bindings,
+                draft_gated_rows::Elements { A: activation }
+            );
+            self.draft_kernels().convolved = match (convolve_input, convolve_residual, gated) {
+                (Some(convolve_input), Some(convolve_residual), Some(gated)) => {
+                    Some(ConvolvedKernels {
+                        convolve_input,
+                        convolve_residual,
+                        gated,
+                    })
+                }
+                _ => None,
+            };
+        }
+        if let Some(selector) = plan.selector() {
+            let top_k = fixed!(self.spec, draft_top_k, "");
+            let path = fixed!(
+                self.spec,
+                draft_path_step,
+                bindings,
+                draft_path_step::Elements { A: activation }
+            );
+            let codebook = |spec: &mut Specializer, table: Element| {
+                spec.fixed(
+                    &format!("selector EW={}", table.name()),
+                    &[("D", selector.rank)],
+                    embedding_rows::native_entry_with(embedding_rows::Elements {
+                        EW: table,
+                        A: activation,
+                    }),
+                )
+            };
+            let predecessor = codebook(&mut self.spec, selector.predecessor)?;
+            let successor = codebook(&mut self.spec, selector.successor)?;
+            self.draft_kernels().selector = match (top_k, path, predecessor, successor) {
+                (Some(top_k), Some(path), Some(predecessor), Some(successor)) => {
+                    Some(SelectorKernels {
+                        top_k,
+                        predecessor,
+                        successor,
+                        path,
+                    })
+                }
+                _ => None,
+            };
+        }
+        if let Some(corrector) = plan.corrector() {
+            let corrector = corrector.clone();
+            let kernels = self.corrector(&corrector, activation)?;
+            self.draft_kernels().corrector = kernels;
+        }
+        Ok(())
+    }
+
+    /// LiLiCorr's corrector entries beside its projections and norms, at its
+    /// geometry. `None` during a tuning count.
+    fn corrector(
+        &mut self,
+        binding: &crate::CorrectorBinding,
+        activation: Element,
+    ) -> Result<Option<CorrectorKernels>, CatalogFailure> {
+        let (width, top_k) = (binding.width, binding.top_k);
+        let slots = binding.slots;
+        let nodes = slots * top_k;
+        let bindings = format!("A={}", activation.name());
+        let top = fixed!(self.spec, draft_top_k, "");
+        let features = fixed!(
+            self.spec,
+            corrector_features,
+            bindings,
+            corrector_features::Elements { A: activation },
+            statics & [("V", self.vocabulary), ("K", top_k), ("H", width)]
+        );
+        let mut rows = HashMap::new();
+        let mut complete = true;
+        for key in super::draft::corrector_rows_keys(binding, activation) {
+            let (columns, residual, output) = key;
+            match fixed!(
+                self.spec,
+                corrector_rows,
+                format!("Y={}", output.name()),
+                corrector_rows::Elements { Y: output },
+                statics & [("N", columns), ("R", residual)]
+            ) {
+                Some(kernel) => {
+                    rows.insert(key, kernel);
+                }
+                None => complete = false,
+            }
+        }
+        let node_rows = self.spec.fixed(
+            "",
+            &[
+                ("J", slots),
+                ("K", top_k),
+                ("H", width),
+                ("TB", u64::from(binding.token.is_some())),
+            ],
+            corrector_nodes::native_entry(),
+        )?;
+        let attention = fixed!(
+            self.spec,
+            corrector_attention,
+            bindings,
+            corrector_attention::Elements { A: activation },
+            statics & [("N", nodes), ("NH", binding.heads), ("W", width / binding.heads)]
+        );
+        let factors = fixed!(
+            self.spec,
+            corrector_factors,
+            bindings,
+            corrector_factors::Elements { A: activation },
+            statics & [("N", nodes), ("H", width)]
+        );
+        let path = self.spec.fixed(
+            "",
+            &[("J", slots), ("K", top_k), ("F", binding.factor)],
+            corrector_path::native_entry(),
+        )?;
+        Ok(
+            match (complete, top, features, node_rows, attention, factors, path) {
+                (
+                    true,
+                    Some(top_k),
+                    Some(features),
+                    Some(nodes),
+                    Some(attention),
+                    Some(factors),
+                    Some(path),
+                ) => Some(CorrectorKernels {
+                    top_k,
+                    features,
+                    rows,
+                    nodes,
+                    attention,
+                    factors,
+                    path,
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    fn draft_kernels(&mut self) -> &mut DraftKernels {
+        self.draft
+            .as_mut()
+            .expect("a draft plan creates the draft group")
+    }
+
+    fn vision(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.target.clone(), true);
+        }
+        let Some(vision_plan) = plan.vision() else {
+            return Ok(());
+        };
+        let spec = &mut self.spec;
+        let vision = self
+            .vision
+            .as_mut()
+            .expect("a vision plan creates the vision group");
+        for kernel in vision_plan.kernels() {
+            let label = format!("{kernel:?}");
+            let statics = kernel.statics.as_slice();
+            macro_rules! element {
+                ($module:ident, $name:literal) => {
+                    super::vision::element(<$module::Entry as seismic::Entry>::NAME, kernel, $name)?
+                };
+            }
+            macro_rules! prepare {
+                ($module:ident, $map:ident, $elements:expr) => {{
+                    let elements = $elements;
+                    if let Some(native) = fixed!(spec, $module, label, elements, statics & statics)
+                    {
+                        vision.$map.insert(kernel.clone(), native);
+                    }
+                }};
+            }
+            match kernel.entry {
+                VisionEntry::PatchStem => prepare!(
+                    vision_patch_stem,
+                    patch_stem,
+                    vision_patch_stem::Elements {
+                        W0: element!(vision_patch_stem, "W0"),
+                        W1: element!(vision_patch_stem, "W1"),
+                        B: element!(vision_patch_stem, "B"),
+                        PE: element!(vision_patch_stem, "PE"),
+                    }
+                ),
+                VisionEntry::Norm => prepare!(
+                    vision_norm,
+                    norm,
+                    vision_norm::Elements {
+                        NWE: element!(vision_norm, "NWE"),
+                        NBE: element!(vision_norm, "NBE"),
+                        Y: element!(vision_norm, "Y"),
+                    }
+                ),
+                VisionEntry::Linear => prepare!(
+                    vision_linear,
+                    linear,
+                    vision_linear::Elements {
+                        A: element!(vision_linear, "A"),
+                        W: element!(vision_linear, "W"),
+                        B: element!(vision_linear, "B"),
+                        Y: element!(vision_linear, "Y"),
+                    }
+                ),
+                VisionEntry::Clamp => prepare!(
+                    vision_clamp,
+                    clamp,
+                    vision_clamp::Elements {
+                        A: element!(vision_clamp, "A"),
+                    }
+                ),
+                VisionEntry::Attention => prepare!(
+                    vision_attention,
+                    attention,
+                    vision_attention::Elements {
+                        A: element!(vision_attention, "A"),
+                    }
+                ),
+                VisionEntry::GatedConvolution => prepare!(
+                    vision_gated_convolution,
+                    gated_convolution,
+                    vision_gated_convolution::Elements {
+                        A: element!(vision_gated_convolution, "A"),
+                        KE: element!(vision_gated_convolution, "KE"),
+                    }
+                ),
+                VisionEntry::Pool => prepare!(
+                    vision_pool,
+                    pool,
+                    vision_pool::Elements {
+                        SB: element!(vision_pool, "SB"),
+                        SS: element!(vision_pool, "SS"),
+                    }
+                ),
+                VisionEntry::Position => prepare!(
+                    vision_position,
+                    position,
+                    vision_position::Elements {
+                        PE: element!(vision_position, "PE"),
+                    }
+                ),
+                VisionEntry::PostNormResidual => prepare!(
+                    post_norm_residual,
+                    post_norm,
+                    post_norm_residual::Elements {
+                        NW: element!(post_norm_residual, "NW"),
+                    }
+                ),
+            }
+        }
+        Ok(())
+    }
+}

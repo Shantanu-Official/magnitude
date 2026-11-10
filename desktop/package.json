@@ -1,0 +1,41 @@
+{
+  "name": "@magnitudedev/desktop",
+  "private": true,
+  "type": "module",
+  "main": "out/main/main.js",
+  "scripts": {
+    "setup": "install-electron --no",
+    "dev": "bun run build:native && bun scripts/dev.ts",
+    "build": "bun run build:native && electron-vite build",
+    "test": "bunx --bun vitest run",
+    "build:native": "bun ../packages/daemon-management/scripts/build-native.ts && bun scripts/build-native.ts"
+  },
+  "dependencies": {
+    "@effect/platform": "^0.96.1",
+    "@effect/platform-node": "^0.107.0",
+    "@effect/rpc": "0.75.1",
+    "@magnitudedev/client-common": "workspace:*",
+    "@magnitudedev/daemon-management": "workspace:*",
+    "@magnitudedev/harness-connections": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/sdk": "workspace:*",
+    "@magnitudedev/web": "workspace:*",
+    "effect": "^3.21.2",
+    "@magnitudedev/utils": "workspace:*",
+    "@magnitudedev/version": "workspace:*",
+    "@phosphor-icons/react": "^2.1.10"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^43.7.0",
+    "electron-vite": "^5.0.0",
+    "node-api-headers": "1.9.0",
+    "playwright": "^1.62.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

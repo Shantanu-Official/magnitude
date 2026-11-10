@@ -1,0 +1,4 @@
+#define SCALE_ROW(row) (SEISMIC_PTR(SEISMIC_BUFFER_X) + (row) * SEISMIC_X_STRIDE_0 * 4ul)
+#include "scale_rows.glsl"
+
+void scale_rows() { scale_rows_body(); }

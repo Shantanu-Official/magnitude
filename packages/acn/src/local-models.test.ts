@@ -1,0 +1,528 @@
+import { Option } from "effect"
+import { describe, expect, it } from "vitest"
+import { ModelIdSchema } from "@magnitudedev/acn-protocol"
+import type {
+  CatalogInstallationOperation,
+  CatalogModel,
+  ModelAssessmentsSnapshot,
+  ReadyModel,
+} from "@magnitudedev/icn-protocol/schemas"
+import {
+  assessmentTargetVisible,
+  availableCatalogModelServingState,
+  catalogAcquisition,
+  catalogRemovalAcquisition,
+  coordinatedAssessment,
+  projectLocalModelPreparation,
+  unavailableCatalogModelServingState,
+} from "./local-models"
+import type { LocalModelSourcesState } from "./local-model-sources"
+
+describe("local model serving projection", () => {
+  it("uses capabilities from the unified assessment result", () => {
+    const ready = {
+      profile: { contextLength: 32_768 },
+      metadata: {
+        format: "gguf",
+        architecture: "test",
+        quantization: "q4_k_m",
+        quantizationName: "Q4_K_M",
+        storageBytes: 1,
+        maximumContextLength: Option.some(32_768),
+      },
+      speculativeMethod: Option.none(),
+    } as unknown as ReadyModel
+    const assessment = {
+      _tag: "Assessed",
+      assessment: {
+        _tag: "Fits",
+        profile: { contextLength: 32_768 },
+        served: { contextLength: 32_768 },
+        residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring" } } },
+      },
+      capabilities: {
+        vision: false,
+        tools: true,
+        structuredOutput: true,
+        reasoning: {
+          supported: true,
+          efforts: ["high"],
+          defaultEffort: Option.some("high"),
+        },
+      },
+    } as unknown as Parameters<typeof availableCatalogModelServingState>[1]
+
+    const state = availableCatalogModelServingState(ready, assessment, { intelligenceScore: 80, fidelityRank: 60 })
+
+    expect(state._tag).toBe("Assessed")
+    if (state._tag !== "Assessed") return
+    expect(state.capabilities.reasoning.defaultEffort).toEqual(Option.some("high"))
+    // A pending speed still ranks by the catalog's terms.
+    expect("rankingScores" in state && state.rankingScores).toEqual({
+      intelligence: 0.8,
+      speed: Option.none(),
+      fidelity: 0.6,
+    })
+    // The same fit of a disabled or deprecated model is never ranked.
+    const unavailable = unavailableCatalogModelServingState(ready, assessment)
+    expect(unavailable._tag === "Assessed" && unavailable.assessment._tag).toBe("Fits")
+    expect("rankingScores" in unavailable).toBe(false)
+  })
+
+  it("projects a non-reasoning model that accepts only an explicit none", () => {
+    const modelId = ModelIdSchema.make("llama-3.2-1b-instruct:gguf:q4")
+    const snapshot = {
+      revision: 1,
+      environmentId: "environment",
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [{
+          subject: { _tag: "Catalog", modelId, selection: "Desired" },
+          state: {
+            _tag: "Assessed",
+            capabilities: {
+              vision: false,
+              tools: true,
+              structuredOutput: true,
+              reasoning: { supported: false, efforts: ["none"], defaultEffort: Option.some("none") },
+            },
+            templateFingerprint: "template",
+            fingerprint: Option.none(),
+            profiles: [{
+              _tag: "Fits",
+              assessmentId: "assessment",
+              profile: { contextLength: 4096 },
+              served: { contextLength: 4096 },
+              memory: [],
+              memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+              residency: {
+                _tag: "Resident",
+                performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+              },
+              drafter: { _tag: "None" },
+            }],
+          },
+        }],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+    const ready = {
+      profile: { contextLength: 4096 },
+      metadata: {
+        format: "gguf", architecture: "llama", quantization: "q4_k_m", quantizationName: "Q4_K_M",
+        storageBytes: 1, maximumContextLength: Option.some(131_072),
+      },
+      speculativeMethod: Option.none(),
+    } as unknown as ReadyModel
+
+    const assessment = coordinatedAssessment(snapshot, "catalog", modelId)
+    expect(assessment?._tag).toBe("Assessed")
+    if (assessment?._tag !== "Assessed") return
+    const state = availableCatalogModelServingState(ready, assessment, { intelligenceScore: 50, fidelityRank: 40 })
+
+    expect(state._tag).toBe("Assessed")
+    if (state._tag !== "Assessed") return
+    expect(state.capabilities.reasoning).toEqual({
+      supported: false, efforts: ["none"], defaultEffort: Option.some("none"),
+    })
+  })
+
+  it("preserves ICN's native unavailability failure", () => {
+    const nativeFailure = {
+      code: "invalid_artifact",
+      message: "The selected GGUF artifact is invalid",
+      retryable: false,
+    }
+    expect(availableCatalogModelServingState(
+      undefined,
+      undefined,
+      { intelligenceScore: 80, fidelityRank: 60 },
+      nativeFailure,
+    )).toEqual({
+      _tag: "Failed",
+      profile: Option.none(),
+      failure: nativeFailure,
+    })
+  })
+})
+
+describe("automatic assessment projection", () => {
+  const modelId = ModelIdSchema.make("test-model:gguf:q4")
+
+  it("keeps a pending slice assessing", () => {
+    const pending = {
+      revision: 1,
+      environmentId: "environment",
+      measurement: { _tag: "Measured" },
+      catalog: { _tag: "Pending", sourceRevision: 1 },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+    expect(coordinatedAssessment(pending, "catalog", modelId)).toBeUndefined()
+  })
+
+  it("drops exact targets", () => {
+    const targetFailure = {
+      revision: 3,
+      environmentId: "environment",
+      measurement: { _tag: "Measured" },
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [{
+          subject: { _tag: "Catalog", modelId, selection: "Desired" },
+          state: { _tag: "Dropped" },
+        }],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+    expect(coordinatedAssessment(targetFailure, "catalog", modelId)).toEqual({ _tag: "Dropped" })
+    expect(assessmentTargetVisible({ _tag: "Dropped" })).toBe(false)
+  })
+
+  it("drops only the target whose capabilities violate the product contract", () => {
+    const badId = ModelIdSchema.make("bad-model:gguf:q4")
+    const entry = (id: typeof modelId, reasoning: unknown) => ({
+      subject: { _tag: "Catalog", modelId: id, selection: "Desired" },
+      state: {
+        _tag: "Assessed",
+        capabilities: { vision: false, tools: true, structuredOutput: true, reasoning },
+        templateFingerprint: "template",
+        fingerprint: Option.none(),
+        profiles: [{
+          _tag: "Fits",
+          assessmentId: "assessment",
+          profile: { contextLength: 4096 },
+          served: { contextLength: 4096 },
+          memory: [],
+          memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+          residency: {
+            _tag: "Resident",
+            performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+          },
+          drafter: { _tag: "None" },
+        }],
+      },
+    })
+    const snapshot = {
+      revision: 1,
+      environmentId: "environment",
+      measurement: { _tag: "Measured" },
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [
+          entry(modelId, { supported: true, efforts: ["none", "high"], defaultEffort: Option.some("high") }),
+          entry(badId, { supported: true, efforts: [], defaultEffort: Option.none() }),
+        ],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+
+    expect(coordinatedAssessment(snapshot, "catalog", modelId)?._tag).toBe("Assessed")
+    expect(coordinatedAssessment(snapshot, "catalog", badId)).toEqual({ _tag: "Dropped" })
+  })
+
+  it("carries the machine's measurement progress into a pending speed", () => {
+    const snapshot = {
+      revision: 4,
+      environmentId: "environment",
+      measurement: { _tag: "Failed", retryAt: 1_000 },
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [{
+          subject: { _tag: "Catalog", modelId, selection: "Desired" },
+          state: {
+            _tag: "Assessed",
+            capabilities: {
+              vision: false,
+              tools: true,
+              structuredOutput: true,
+              reasoning: { supported: true, efforts: ["none", "high"], defaultEffort: Option.some("high") },
+            },
+            profiles: [{
+              _tag: "Fits",
+              profile: { contextLength: 32_768 },
+              served: { contextLength: 32_768 },
+              assessmentId: "assessment",
+              memory: [],
+              memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+              residency: {
+                _tag: "Streamed",
+                bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
+                performance: { _tag: "Pending" },
+                floorPerformance: { _tag: "Pending" },
+              },
+              drafter: { _tag: "None" },
+            }],
+          },
+        }],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+    const coordinated = coordinatedAssessment(snapshot, "catalog", modelId)
+    const fits = coordinated?._tag === "Assessed" && coordinated.assessment._tag === "Fits"
+      ? coordinated.assessment
+      : undefined
+    expect(fits?.residency).toEqual({
+      _tag: "Streamed",
+      bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
+      performance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
+      floorPerformance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
+    })
+  })
+})
+
+describe("local model preparation projection", () => {
+  const sources = (
+    reconciliationComplete: boolean,
+    catalogModels: number,
+    discoveredModels: number,
+  ): LocalModelSourcesState => ({
+    catalogRevision: 1,
+    localModelsRevision: 1,
+    reconciliationComplete,
+    catalogModels: Array.from({ length: catalogModels }) as unknown as LocalModelSourcesState["catalogModels"],
+    customModels: Array.from({ length: discoveredModels }) as unknown as LocalModelSourcesState["customModels"],
+    hiddenModels: [],
+    unsupported: [],
+  })
+  const entries = (settled: number, total: number, prefix: string) => Array.from({ length: total }, (_, index) => ({
+    subject: {
+      _tag: "Catalog" as const,
+      modelId: ModelIdSchema.make(`${prefix}:gguf:variant-${index}`),
+      selection: "Desired" as const,
+    },
+    state: index < settled
+      ? { _tag: "Dropped" as const }
+      : { _tag: "Assessing" as const },
+  }))
+
+  it("projects live counts and allows the assessment total to grow", () => {
+    const discovering = projectLocalModelPreparation(
+      sources(false, 4, 1),
+      {
+        revision: 1,
+        environmentId: "environment",
+        measurement: { _tag: "Measured" },
+        catalog: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(2, 4, "discovering-catalog"),
+        },
+        custom: { _tag: "Pending", sourceRevision: 1 },
+      } as unknown as ModelAssessmentsSnapshot,
+    )
+    const discovered = projectLocalModelPreparation(
+      sources(true, 4, 3),
+      {
+        revision: 2,
+        environmentId: "environment",
+        measurement: { _tag: "Measured" },
+        catalog: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(4, 4, "discovered-catalog"),
+        },
+        custom: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(1, 3, "discovered-local"),
+        },
+      } as unknown as ModelAssessmentsSnapshot,
+    )
+
+    expect(discovering).toEqual({
+      discovery: { complete: false, modelsFound: 1 },
+      assessment: { complete: false, settledModels: 2, totalModels: 4 },
+    })
+    expect(discovered).toEqual({
+      discovery: { complete: true, modelsFound: 3 },
+      assessment: { complete: false, settledModels: 5, totalModels: 7 },
+    })
+  })
+
+  it("is complete only when both assessment domains are complete", () => {
+    expect(projectLocalModelPreparation(
+      sources(true, 2, 1),
+      {
+        revision: 1,
+        environmentId: "environment",
+        measurement: { _tag: "Measured" },
+        catalog: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(2, 2, "complete-catalog"),
+        },
+        custom: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(1, 1, "complete-local"),
+        },
+      } as unknown as ModelAssessmentsSnapshot,
+    )).toEqual({
+      discovery: { complete: true, modelsFound: 1 },
+      assessment: { complete: true, settledModels: 3, totalModels: 3 },
+    })
+  })
+
+  it("stays complete across a source revision the assessments have not caught up to", () => {
+    expect(projectLocalModelPreparation(
+      { ...sources(true, 2, 1), localModelsRevision: 2 },
+      {
+        revision: 2,
+        environmentId: "environment",
+        measurement: { _tag: "Measured" },
+        catalog: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(2, 2, "stale-catalog"),
+        },
+        custom: {
+          _tag: "Available",
+          sourceRevision: 1,
+          entries: entries(1, 1, "stale-local"),
+        },
+      } as unknown as ModelAssessmentsSnapshot,
+    )).toEqual({
+      discovery: { complete: true, modelsFound: 1 },
+      assessment: { complete: true, settledModels: 3, totalModels: 3 },
+    })
+  })
+})
+
+describe("catalog removal projection", () => {
+  const installed = {
+    _tag: "Installed" as const,
+    installation: {
+      _tag: "Resolved" as const,
+      installedBytes: 1,
+      primaryPath: "/models/model.gguf",
+      ownership: "Magnitude" as const,
+    },
+    residencyState: { _tag: "Unloaded" as const },
+  }
+
+  it("projects admitted and failed removals without losing installed evidence", () => {
+    expect(catalogRemovalAcquisition(installed, { _tag: "Removing" })).toMatchObject({
+      _tag: "Removing",
+      installation: installed.installation,
+    })
+    const failure = { code: "remove_failed", message: "Removal failed", retryable: true }
+    expect(catalogRemovalAcquisition(installed, { _tag: "RemoveFailed", failure })).toMatchObject({
+      _tag: "RemoveFailed",
+      installation: installed.installation,
+      failure,
+    })
+  })
+
+  it("does not let a rejected removal hide an active update", () => {
+    const updating = {
+      _tag: "Updating" as const,
+      installation: installed.installation,
+      residencyState: installed.residencyState,
+      progress: {
+        stage: "downloading" as const,
+        completedBytes: 1,
+        totalBytes: 2,
+        bytesPerSecond: Option.some(1),
+      },
+    }
+    expect(catalogRemovalAcquisition(updating, { _tag: "Removing" })).toBe(updating)
+    expect(catalogRemovalAcquisition(updating, {
+      _tag: "RemoveFailed",
+      failure: { code: "catalog_installation_active", message: "active", retryable: false },
+    })).toBe(updating)
+  })
+})
+
+describe("catalog acquisition projection", () => {
+  it("does not let an obsolete failed occurrence override a now-current installation", () => {
+    const model = {
+      localState: {
+        _tag: "Installed",
+        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" },
+        updateState: { _tag: "Current" },
+      },
+    } as unknown as CatalogModel
+    const operation = {
+      state: {
+        _tag: "Failed",
+        acknowledged: false,
+        failure: { _tag: "NetworkUnavailable" },
+      },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toMatchObject({ _tag: "Installed" })
+  })
+
+  it("names what a catalog update brings, calling a new projector image input", () => {
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: {
+        _tag: "Installed",
+        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" },
+        updateState: { _tag: "Available", requiredDownloadBytes: 1_500, parts: ["Projector", "Drafter"] },
+      },
+    } as unknown as CatalogModel
+
+    expect(catalogAcquisition(model, undefined, { _tag: "Unloaded" })).toMatchObject({ _tag: "UpdateAvailable", parts: ["ImageInput", "Drafter"] })
+  })
+
+  it("projects post-download optimization as an installed model with its tuning progress", () => {
+    const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" }
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: { _tag: "Installed", installation, updateState: { _tag: "Current" } },
+    } as unknown as CatalogModel
+    const operation = {
+      state: {
+        _tag: "Optimizing",
+        progress: { stage: "tuning", completed: 3, total: 12, device: Option.some({ id: "metal:0", backend: "metal" }) },
+      },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toEqual({
+      _tag: "Optimizing",
+      installation,
+      residencyState: { _tag: "Unloaded" },
+      progress: { stage: "tuning", completed: 3, total: 12, device: Option.some({ deviceId: "metal:0", backend: "metal" }) },
+    })
+  })
+
+  it("projects an optimization waiting for the device as pending, neither tuning nor done", () => {
+    const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" }
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: { _tag: "Installed", installation, updateState: { _tag: "Current" } },
+    } as unknown as CatalogModel
+    const operation = {
+      state: {
+        _tag: "Optimizing",
+        progress: { stage: "waiting", completed: 0, total: 0, device: Option.some({ id: "metal:0", backend: "metal" }) },
+      },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Ready" } as never)).toEqual({
+      _tag: "OptimizationPending",
+      installation,
+      residencyState: { _tag: "Ready" },
+    })
+  })
+
+  it("keeps an optimizing download finishing until the catalog observes its installation", () => {
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: { _tag: "NotInstalled" },
+    } as unknown as CatalogModel
+    const operation = {
+      state: { _tag: "Optimizing", progress: { stage: "preparing", completed: 0, total: 0, device: Option.none() } },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toEqual({
+      _tag: "Installing",
+      progress: { stage: "publishing", completedBytes: 7, totalBytes: 7, bytesPerSecond: Option.none() },
+    })
+  })
+})

@@ -1,0 +1,15 @@
+[package]
+name = "magnitude-family-qwen35"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../../artifacts" }
+magnitude-family-common = { path = "../common" }
+magnitude-family-contracts = { path = "../contracts" }
+magnitude-family-qwen = { path = "../qwen" }
+sha2 = "=0.11.0"
+
+[dev-dependencies]
+magnitude-family-common = { path = "../common", features = ["catalog-headers"] }

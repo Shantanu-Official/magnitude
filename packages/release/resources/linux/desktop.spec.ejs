@@ -1,0 +1,68 @@
+# The payload is an already assembled application, not compiler inputs. Do not
+# strip, rewrite debug sections, or otherwise alter embedded native executables.
+%global __os_install_post %{nil}
+%global debug_package %{nil}
+# Bundled binaries can share build IDs with other apps, but their global links
+# would point at different application directories and conflict during install.
+%global _build_id_links none
+%define _binary_payload w2.xzdio
+
+Name: <%= name %>
+Version: <%= version %>
+Release: <%= revision %>
+Summary: <%= description %>
+License: <%= license %>
+URL: <%= homepage %>
+Requires: <%= requires.join(', ') %>
+AutoReqProv: no
+
+%description
+<%= productDescription %>
+
+%install
+mkdir -p %{buildroot}/usr/
+cp -a usr/. %{buildroot}/usr/
+find %{buildroot}/usr/lib/<%= name %> -type d -exec chmod 0755 {} +
+find %{buildroot}/usr/lib/<%= name %> -type f -exec chmod go-w {} +
+ln -s ../lib/<%= name %>/resources/magnitude %{buildroot}/usr/bin/magnitude
+@MAGNITUDE_SYSTEM_INSTALL@
+
+%files
+%defattr(-,root,root)
+/usr/bin/<%= name %>
+/usr/bin/magnitude
+/usr/lib/<%= name %>/
+/usr/share/applications/<%= name %>.desktop
+/usr/share/doc/<%= name %>/
+/usr/share/icons/hicolor/256x256/apps/<%= name %>.png
+@MAGNITUDE_SYSTEM_FILES@
+
+%pre
+set -eu
+@MAGNITUDE_INSTALL_BEGIN@
+
+%post
+set -eu
+@MAGNITUDE_RESTORE_SERVER_GRANT@@MAGNITUDE_RELOAD_SYSTEMD@@MAGNITUDE_REFRESH_DESKTOP_DATABASE@@MAGNITUDE_INSTALL_END@
+
+%preun
+set -eu
+[ "$1" -eq 0 ] || exit 0
+if ! (
+@MAGNITUDE_INSTALL_BEGIN@
+); then
+  # DNF can remove automatic dependencies even when this package's removal fails.
+  touch /var/lib/magnitude-desktop/installing
+  # The refusal above already said why; this only says what the retained gate means.
+  if systemctl is-active --quiet magnitude.service 2>/dev/null; then
+    echo 'Magnitude was not removed, and its server keeps running. DNF may still remove packages it depends on in this transaction, so before the server starts again, reinstall its package (run the install script again, or `sudo dnf reinstall magnitude-desktop`).' >&2
+  else
+    echo 'Magnitude was not removed. DNF may still remove packages it depends on in this transaction, so before starting Magnitude again, reinstall its package (run the install script again, or `sudo dnf reinstall magnitude-desktop`).' >&2
+  fi
+  exit 1
+fi
+
+%postun
+set -eu
+[ "$1" -eq 0 ] || exit 0
+@MAGNITUDE_REMOVE_SERVER_GRANT@@MAGNITUDE_RELOAD_SYSTEMD@@MAGNITUDE_REFRESH_DESKTOP_DATABASE@@MAGNITUDE_INSTALL_END@

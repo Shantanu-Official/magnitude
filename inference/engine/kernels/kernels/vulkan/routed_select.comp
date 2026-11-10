@@ -1,0 +1,6 @@
+#define SELECT_ROUTER_ROWS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ROUTER_ROWS)
+#include "lib/routed/selection.glsl"
+void routed_select_gemv() { select_gemv(); }
+void routed_select_select() { select_select(); }
+void routed_select_stage() { select_stage(); }
+void routed_select_gemm() { select_gemm(); }

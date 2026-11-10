@@ -1,0 +1,225 @@
+import { Context, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
+import {
+  CatalogFormModelIdSchema,
+  CustomFormModelIdSchema,
+  ModelIdSchema,
+  ModelSlotMutationRejected,
+  ModelVersionNotRunnable,
+  PRIMARY_SLOT_ID,
+  LocalModelMutationFailed,
+  type CatalogComponent,
+  type LocalInferenceError,
+  type LocalModelSyncOutcome,
+  type ModelId,
+  type CatalogFormModelId,
+  type ModelLoadPlan,
+  type SlotId,
+} from "@magnitudedev/acn-protocol"
+import { IcnCatalogInstallations, IcnClient, IcnInstances } from "@magnitudedev/icn"
+import { canonicalLocalModelId, localModelIsInstalled, projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
+import { LocalModels } from "./local-models"
+import { ModelSlotController } from "./model-slot-controller"
+import { LocalModelRemovals } from "./local-model-removals"
+import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"
+import { CustomModelCommands } from "./custom-model-commands"
+import { CatalogModelSync } from "./catalog-model-sync"
+
+/** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
+export interface ModelCommandsApi {
+  readonly sync: (modelId: ModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError | ModelVersionNotRunnable>
+  readonly downloadCatalogComponent: (modelId: ModelId, component: CatalogComponent) =>
+    Effect.Effect<{ readonly started: boolean }, LocalInferenceError>
+  readonly cancelSync: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly acknowledgeSyncFailure: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  /** What a completed removal kept: the parts Magnitude stores for a found catalog model that another model needs. */
+  readonly remove: (modelId: ModelId) => Effect.Effect<{ readonly keptComponents: readonly CatalogComponent[] }, LocalInferenceError>
+  readonly loadSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
+  readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
+  readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
+  readonly loadModel: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError | ModelVersionNotRunnable>
+  readonly stopModel: (modelId: ModelId) => Effect.Effect<{ readonly stopped: boolean }, LocalInferenceError>
+  readonly stopActiveModel: Effect.Effect<{}, LocalInferenceError>
+}
+export class ModelCommands extends Context.Tag("ModelCommands")<ModelCommands, ModelCommandsApi>() {}
+
+export const modelCommandFailure = (operation: string, cause: IcnCommandError) =>
+  icnCommandFailure(operation, cause)
+
+export const ModelCommandsLive: Layer.Layer<
+  ModelCommands,
+  never,
+  | IcnClient | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals
+  | CustomModelCommands | LocalModels | CatalogModelSync
+> = Layer.scoped(ModelCommands, Effect.gen(function* () {
+  const custom = yield* CustomModelCommands
+  const catalogSync = yield* CatalogModelSync
+  const localModels = yield* LocalModels
+  /** A catalog model's alias (its files' ID as a found model, before an upgrade) names that catalog model. */
+  const canonical = (modelId: ModelId) => localModels.state.pipe(
+    Effect.map(({ models, hidden }) => canonicalLocalModelId([...models, ...hidden], modelId)),
+  )
+  const onThisComputer = (modelId: ModelId) => localModels.state.pipe(Effect.flatMap(({ models, hidden }) =>
+    [...models, ...hidden].some((model) => model.modelId === modelId)
+      ? Effect.succeed(modelId)
+      : Effect.fail(new LocalModelMutationFailed({
+          code: "model_not_found",
+          message: `${modelId} is not a model on this computer.`,
+          retryable: false,
+        }))))
+  /** A model the engine can't run is refused with its reasons before ICN is asked to load it. */
+  const runnable = (modelId: ModelId) => localModels.state.pipe(Effect.flatMap(({ models, unsupported }) => {
+    const served = models.find((model) => model.modelId === modelId)?.servingState
+    const reasons = served?._tag === "Assessed" && served.assessment._tag === "Unsupported"
+      ? served.assessment.reasons
+      : unsupported.find((model) => Option.getOrUndefined(model.modelId) === modelId)?.reasons
+    return reasons === undefined
+      ? Effect.succeed(modelId)
+      : Effect.fail(new ModelVersionNotRunnable({
+          reference: modelId,
+          version: modelId,
+          verdict: { _tag: "Unsupported", reasons },
+        }))
+  }))
+  /**
+   * A catalog model not yet on this computer that needs more memory than it can provide is refused before ICN is
+   * asked to download it. An installed one still updates, and one not yet assessed is never refused.
+   */
+  const downloadable = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.flatMap(({ models }) => {
+    const model = models.find((candidate) => candidate.modelId === modelId)
+    const serving = model?.servingState
+    return model === undefined || serving?._tag !== "Assessed" || serving.assessment._tag !== "DoesNotFit"
+      || localModelIsInstalled(model)
+      ? Effect.succeed(modelId)
+      : Effect.fail(new ModelVersionNotRunnable({
+          reference: modelId,
+          version: modelId,
+          verdict: { _tag: "DoesNotFit", deficitBytes: serving.assessment.deficitBytes },
+        }))
+  }))
+  const scope = yield* Effect.scope
+  const client = yield* IcnClient
+  const installations = yield* IcnCatalogInstallations
+  const instances = yield* IcnInstances
+  const slots = yield* ModelSlotController
+  const removals = yield* LocalModelRemovals
+  const selectedLocalModel = (slotId: SlotId) => slots.state.pipe(
+    Effect.map((state) => state.slots[slotId === PRIMARY_SLOT_ID ? "primary" : "secondary"]),
+    Effect.filterOrFail((slot) => slot._tag === "ConfiguredLocal", () => new ModelSlotMutationRejected({
+      slotId, message: "The slot does not contain a configured local model",
+    })),
+    Effect.flatMap((slot) => Schema.decodeUnknown(ModelIdSchema)(slot.selection.providerModelId).pipe(
+      Effect.mapError(() => new ModelSlotMutationRejected({
+        slotId,
+        message: "The slot does not contain a canonical local model identity",
+      })),
+    )),
+  )
+  const operationFor = (modelId: ModelId) => installations.get.pipe(
+    Effect.map(({ state }) => state.operations.findLast((operation) => operation.modelId === modelId)),
+  )
+  const admitted = (modelId: ModelId) => instances.changes.pipe(
+    Stream.filter(({ instances: current }) => current.some((instance) => instance.modelId === modelId
+      && (instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready"))),
+    Stream.runHead,
+  )
+  /**
+   * ICN's warm demand answers only once the Instance is Ready, which can take many minutes. ACN
+   * issues that demand in its own lifetime rather than the caller's and acknowledges the load once
+   * ICN admits it, or with the demand's own earlier outcome, so no caller holds a request open for
+   * the duration of a load.
+   */
+  const requestLoad = (modelId: ModelId) => Effect.gen(function* () {
+    const demand = yield* client.models.ensureModelInstance({ payload: { modelId } }).pipe(Effect.forkIn(scope))
+    yield* Effect.raceFirst(Fiber.join(demand), admitted(modelId))
+    return {}
+  })
+  const stopModel = (modelId: ModelId) => Effect.gen(function* () {
+    const instance = (yield* instances.get).instances.findLast((candidate) => candidate.modelId === modelId
+      && (candidate.lifecycle._tag === "Loading" || candidate.lifecycle._tag === "Ready" || candidate.lifecycle._tag === "Stopping"))
+    if (instance !== undefined) yield* client.models.stopModelInstance({ path: { instance_id: instance.id } })
+    return { stopped: instance !== undefined }
+  }).pipe(Effect.mapError((cause) => modelCommandFailure("stop", cause)))
+  const byForm = <A, CatalogError, CustomError>(
+    requested: ModelId,
+    catalogCommand: (id: CatalogFormModelId) => Effect.Effect<A, CatalogError>,
+    customCommand: (id: typeof CustomFormModelIdSchema.Type) => Effect.Effect<A, CustomError>,
+  ) => canonical(requested).pipe(Effect.flatMap((modelId): Effect.Effect<A, CatalogError | CustomError> => Schema.is(CatalogFormModelIdSchema)(modelId)
+    ? catalogCommand(modelId)
+    : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))))
+  const catalogCancel = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
+      Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
+      Effect.flatMap((operation) => operation === undefined
+        || (operation.state._tag !== "Pending" && operation.state._tag !== "Running"
+          && operation.state._tag !== "Optimizing")
+        ? Effect.succeed({})
+        : client.catalog.cancelCatalogInstallation({ path: { operation_id: operation.operationId } }).pipe(
+            Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
+            Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
+          )),
+    )
+  const catalogAcknowledge = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
+      Effect.mapError((cause) => modelCommandFailure("acknowledge_sync_failure", cause)),
+      Effect.flatMap((operation) => operation?.state._tag !== "Failed" || operation.state.acknowledged
+        ? Effect.succeed({})
+        : client.catalog.acknowledgeCatalogInstallationFailure({ path: { operation_id: operation.operationId } }).pipe(
+            Effect.mapError((cause) => modelCommandFailure("acknowledge_sync_failure", cause)),
+            Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
+          )),
+    )
+  /** Whether Magnitude stores parts (a projector or drafter) of a catalog model whose weights are found elsewhere. */
+  const storesComponents = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.map(({ models, hidden }) =>
+    [...models, ...hidden].some((model) => model._tag === "Catalog" && model.modelId === modelId && model.storedComponents.length > 0)))
+  const installing = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
+    Effect.map((operation) => operation !== undefined && (operation.state._tag === "Pending"
+      || operation.state._tag === "Running" || operation.state._tag === "Optimizing")),
+    Effect.mapError((cause) => modelCommandFailure("remove", cause)),
+  )
+  // Remove never deletes files Magnitude doesn't own. A catalog model whose weights are found elsewhere loses only
+  // Magnitude's own parts, the ones it stores and any it is still fetching (that installation is cancelled), and
+  // keeps running from the found file; with none, it is hidden instead, as Remove hides any found model.
+  const keptNothing = { keptComponents: [] }
+  const catalogRemove = (modelId: CatalogFormModelId) => Effect.all([custom.externalCatalogFiles(modelId), storesComponents(modelId)]).pipe(
+    Effect.flatMap(([external, stored]) => Option.isNone(external)
+      ? stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId)))
+      : installing(modelId).pipe(Effect.flatMap((fetching) => stopModel(modelId).pipe(
+          Effect.zipRight(fetching ? catalogCancel(modelId) : Effect.succeed({})),
+          Effect.zipRight(stored
+            ? removals.remove(modelId)
+            : fetching ? Effect.succeed(keptNothing) : custom.hide(modelId).pipe(Effect.as(keptNothing))),
+        )))),
+  )
+  return ModelCommands.of({
+    sync: (modelId) => byForm(modelId, (id) => downloadable(id).pipe(Effect.flatMap(catalogSync.sync)), custom.sync),
+    downloadCatalogComponent: (modelId, component) => byForm(
+      modelId,
+      (id) => catalogSync.downloadComponent(id, component),
+      (id) => Effect.fail(new LocalModelMutationFailed({
+        code: "catalog_component_requires_catalog_model",
+        message: `${id} is not a catalog model; only catalog models have components to download`,
+        retryable: false,
+      })),
+    ),
+    cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
+    acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
+    remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(id).pipe(Effect.zipRight(custom.remove(id)), Effect.as(keptNothing))),
+    loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
+      Effect.flatMap(requestLoad),
+      Effect.tap(() => slots.refresh),
+      Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("load", cause))),
+    previewSlotLoad: (slotId) => selectedLocalModel(slotId).pipe(
+      Effect.flatMap((modelId) => client.models.previewModelLoad({ path: { model_id: modelId } })),
+      Effect.map(projectInferenceLoadPlan),
+      Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("preview", cause))),
+    stopSlot: (slotId) => selectedLocalModel(slotId).pipe(Effect.flatMap(stopModel), Effect.as({})),
+    loadModel: (modelId) => canonical(modelId).pipe(
+      Effect.flatMap(runnable),
+      Effect.flatMap((id) => requestLoad(id).pipe(Effect.mapError((cause) => modelCommandFailure("load", cause)))),
+    ),
+    stopModel: (modelId) => canonical(modelId).pipe(Effect.flatMap(onThisComputer), Effect.flatMap(stopModel)),
+    stopActiveModel: instances.get.pipe(Effect.flatMap(({ instances: current }) => {
+      const active = current.findLast((instance) =>
+        instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready" || instance.lifecycle._tag === "Stopping")
+      return active === undefined ? Effect.succeed({}) : client.models.stopModelInstance({ path: { instance_id: active.id } }).pipe(Effect.as({}))
+    }), Effect.mapError((cause) => modelCommandFailure("stop", cause))),
+  })
+}))

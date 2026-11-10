@@ -1,0 +1,272 @@
+import { Option, Schema } from "effect"
+import { describe, expect, it } from "vitest"
+import {
+  AssessmentEnvironmentIdSchema,
+  CatalogSupportSchema,
+  LocalInferenceMemoryDomainIdSchema,
+  LocalModelSchema,
+  ModelIdSchema,
+  ModelAssessmentIdSchema,
+  ModelVariantLabelSchema,
+  localModelIsAvailable,
+  type AvailableCatalogLocalModel,
+  type CatalogSupport,
+  type LocalModel,
+  type LocalModelsState,
+  type ServingProfile,
+} from "@magnitudedev/acn-protocol"
+import { localProviderOfferingsReady, projectLocalProviderOfferings } from "./local-provider-offerings"
+
+const capabilities = {
+  vision: false,
+  tools: true,
+  structuredOutput: true,
+  reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+} as const
+
+const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel => {
+  const providerModelId = ModelIdSchema.make(modelId)
+  const installation = {
+    _tag: "Resolved",
+    installedBytes: 1_000,
+    primaryPath: "/models/model.gguf",
+    ownership: source === "Catalog" ? "Magnitude" : "External",
+  } as const
+  const servingState = {
+    _tag: "Assessed",
+    metadata: {
+      format: "gguf",
+      architecture: "test",
+      quantization: "Q4",
+      quantizationName: "4-bit",
+      storageBytes: 1_000,
+      maximumContextLength: Option.some(32_768),
+    },
+    capabilities,
+    speculativeMethod: Option.none(),
+    assessment: {
+      _tag: "Fits",
+      assessmentId: ModelAssessmentIdSchema.make(`assessment-${source}`),
+      environmentId: AssessmentEnvironmentIdSchema.make("environment"),
+      profile: { contextLength: 32_768 },
+      served: { contextLength: 32_768 },
+      memory: {
+        domains: [],
+        totalRequiredBytes: 0,
+        requiredSystemMemoryBytes: 0,
+        breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+      },
+      residency: {
+        _tag: "Resident",
+        performance: {
+          _tag: "Estimated",
+          samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
+        },
+      },
+    },
+  } as const
+  if (source === "Discovered") {
+    return Schema.validateSync(LocalModelSchema)({
+      _tag: "Custom",
+      modelId: providerModelId,
+      origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
+      presentation: {
+        displayName: "Model",
+        variantLabel: ModelVariantLabelSchema.make("Q4"),
+        sourceLabel: "Hugging Face cache",
+        variantOf: Option.none(),
+        license: Option.none(),
+        sourceUrls: [],
+      },
+      drafter: Option.none(),
+      drafterPending: false,
+      drafterChoice: { _tag: "Auto" },
+      recommendedDrafter: Option.none(),
+      acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
+      servingState,
+      storageBytes: 1_000,
+    })
+  }
+  return Schema.validateSync(LocalModelSchema)({
+    _tag: "Catalog",
+    modelId: providerModelId,
+    storageBytes: 1_000,
+    presentation: {
+      displayName: "Model",
+      variantLabel: ModelVariantLabelSchema.make("Q4"),
+      description: "",
+      license: Option.none(),
+      sourceUrls: [],
+    },
+    catalogData: {
+      releaseDate: "2026-08-29",
+      parameterization: { architecture: "dense", totalParameters: 1 },
+      intelligence: 1,
+      support: { _tag: "Supported" },
+      fidelityRank: 1,
+      quantizationAware: false,
+      aliases: [],
+    },
+    acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
+    servingState: {
+      ...servingState,
+      rankingScores: { intelligence: 0.01, speed: Option.none(), fidelity: 0.01 },
+    },
+    missingComponents: [],
+    storedComponents: [],
+    drafterWithheld: false,
+  })
+}
+
+const catalogAssessed = (modelId: string): AvailableCatalogLocalModel => {
+  const model = assessed(modelId, "Catalog")
+  if (model._tag !== "Catalog" || !localModelIsAvailable(model)) throw new Error("expected a supported catalog model")
+  return model
+}
+
+/** The same model as the release disables or deprecates it: still rated, and no longer ranked. */
+const unavailable = (model: AvailableCatalogLocalModel, support: CatalogSupport): LocalModel => {
+  const { rankingScores: _rankingScores, ...servingState } = model.servingState as { readonly rankingScores?: unknown }
+  const { intelligence } = model.catalogData
+  return Schema.validateSync(LocalModelSchema)({
+    ...model,
+    catalogData: {
+      ...model.catalogData,
+      support,
+      intelligence: support._tag === "Disabled" ? Option.some(intelligence) : intelligence,
+    },
+    servingState,
+  })
+}
+
+describe("local provider offerings", () => {
+  it("preserves canonical catalog and custom model IDs unchanged", () => {
+    const catalog = assessed("qwen3.5-4b:gguf:q4", "Catalog")
+    const discovered = assessed("hf:owner/repository/model-q5.gguf", "Discovered")
+    const projection = projectLocalProviderOfferings([catalog, discovered])
+
+    expect(projection.offerings.map(({ providerModelId }) => providerModelId)).toEqual([
+      catalog.modelId,
+      discovered.modelId,
+    ])
+    expect(projection.offerings.every(({ profile }) => profile.contextLength === 32_768)).toBe(true)
+    expect(projection.offerings.every(({ capabilities }) => capabilities.tools)).toBe(true)
+  })
+
+  it("does not fabricate offerings or provider metadata before assessment", () => {
+    const model = catalogAssessed("qwen3.5-4b:gguf:q4")
+    const projection = projectLocalProviderOfferings([{
+      ...model,
+      servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } },
+    }])
+    expect(projection).toEqual({ offerings: [], entries: [] })
+  })
+
+  it("lists an unsupported model with a profile but not an unreadable one, which has none", () => {
+    const model = assessed("hf:owner/repository/model-q5.gguf", "Discovered")
+    if (model._tag !== "Custom" || model.servingState._tag !== "Assessed") throw new Error("expected an assessed custom model")
+    const serving = model.servingState
+    const unsupported = (profile: Option.Option<ServingProfile>): LocalModel => ({
+      ...model,
+      servingState: {
+        ...serving,
+        assessment: {
+          _tag: "Unsupported",
+          environmentId: AssessmentEnvironmentIdSchema.make("environment"),
+          profile,
+          reasons: [{ _tag: "Unreadable" }],
+          detail: "file is shorter than its header declares",
+        },
+      },
+    })
+    expect(projectLocalProviderOfferings([unsupported(Option.none())])).toEqual({ offerings: [], entries: [] })
+    const listed = projectLocalProviderOfferings([unsupported(Option.some({ contextLength: 8_192 }))])
+    expect(listed.offerings).toEqual([])
+    expect(listed.entries.map(({ contextWindow }) => contextWindow)).toEqual([8_192])
+  })
+
+  it("preserves resource and compatibility reasons in provider catalog entries", () => {
+    const model = catalogAssessed("qwen3.5-4b:gguf:q4")
+    if (model.servingState._tag !== "Assessed") throw new Error("expected assessed model")
+    const serving = model.servingState
+    const doesNotFit: LocalModel = {
+      ...model,
+      servingState: {
+        _tag: "Assessed",
+        metadata: serving.metadata,
+        capabilities: serving.capabilities,
+        speculativeMethod: serving.speculativeMethod,
+        assessment: {
+          _tag: "DoesNotFit",
+          assessmentId: ModelAssessmentIdSchema.make("does-not-fit"),
+          environmentId: AssessmentEnvironmentIdSchema.make("environment"),
+          profile: { contextLength: 32_768 },
+          shortfall: { contextLength: 32_768 },
+          memoryDomains: [{
+            memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("system"),
+            capacityBytes: 0,
+            requiredBytes: 1,
+            compatibilityReserveBytes: 0,
+            remainingBytes: -1,
+          }],
+          totalRequiredBytes: 1,
+          deficitBytes: 1,
+          limitingResource: "system",
+        },
+      },
+    }
+    expect(projectLocalProviderOfferings([doesNotFit]).entries[0]?.availability).toEqual({
+      _tag: "Disabled",
+      reason: "insufficient_resources",
+    })
+  })
+
+  it("never offers a deprecated catalog model even when it fits and is installed", () => {
+    const model = catalogAssessed("bonsai-8b-q1:gguf:q1-qat")
+    const deprecated = unavailable(model, Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated",
+      since: "2026-09-27",
+      replacement: "qwen3.5-4b:gguf:q4",
+      reason: "unsupported architecture",
+    }))
+    const projection = projectLocalProviderOfferings([deprecated])
+    expect(projection.offerings).toEqual([])
+    expect(projection.entries[0]?.availability).toEqual({ _tag: "Disabled", reason: "deprecated" })
+  })
+
+  it("never offers a disabled catalog model even when it fits and is installed", () => {
+    const model = catalogAssessed("minicpm5-1b:gguf:q4")
+    const disabled = unavailable(model, { _tag: "Disabled", reason: "not yet qualified" })
+    const projection = projectLocalProviderOfferings([disabled])
+    expect(projection.offerings).toEqual([])
+    expect(projection.entries[0]?.availability).toEqual({ _tag: "Disabled", reason: "catalog_disabled" })
+  })
+
+  it("does not make temporary startup or assessment emptiness authoritative", () => {
+    const model = catalogAssessed("qwen3.5-4b:gguf:q4")
+    const state = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => ({
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+      },
+      models: [model],
+      unsupported: [],
+      hidden: [],
+      ...overrides,
+    })
+    expect(localProviderOfferingsReady(state())).toBe(true)
+    expect(localProviderOfferingsReady(state({
+      models: [{ ...model, servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } } }],
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: false, settledModels: 0, totalModels: 1 },
+      },
+    }))).toBe(false)
+    expect(localProviderOfferingsReady(state({
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: false, settledModels: 0, totalModels: 1 },
+      },
+    }))).toBe(false)
+  })
+})

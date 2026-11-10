@@ -1,0 +1,67 @@
+---
+title: "OpenCode"
+description: "Connect OpenCode to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install OpenCode](https://opencode.ai/docs/#install) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → OpenCode** and click **Connect**.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
+
+Choose a Magnitude model in OpenCode’s model selector. If you use JSONC or an explicit OpenCode config, check the configuration paths shown in Connections: OpenCode can merge more than one file.
+
+## Run OpenCode
+
+After connecting in Magnitude, start OpenCode v2 with:
+
+```sh
+OPENCODE_CONFIG_CONTENT='{"model":"magnitude/MODEL_ID"}' opencode --standalone
+```
+
+In PowerShell:
+
+```powershell
+$env:OPENCODE_CONFIG_CONTENT='{"model":"magnitude/MODEL_ID"}'; opencode --standalone
+```
+
+On OpenCode v1, use:
+
+```sh
+opencode --model magnitude/MODEL_ID
+```
+
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** matches your installed OpenCode version and already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+
+## Configuration
+
+**Connect** writes `~/.config/opencode/opencode.json`. Location overrides: `OPENCODE_CONFIG` and `XDG_CONFIG_HOME`.
+
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on OpenCode and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
+
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "provider": {
+    "magnitude": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Magnitude",
+      "options": { "baseURL": "http://ADDRESS:10100/inference/v1", "apiKey": "API_KEY" },
+      "models": {
+        "MODEL_ID": { "name": "MODEL_ID", "limit": { "context": 32768, "output": 8192 } }
+      }
+    }
+  }
+}
+```

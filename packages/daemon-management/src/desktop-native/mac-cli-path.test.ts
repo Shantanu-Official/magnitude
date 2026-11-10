@@ -1,0 +1,103 @@
+import { FileSystem } from "@effect/platform"
+import { NodeContext } from "@effect/platform-node"
+import { Effect, Option } from "effect"
+import { execFileSync } from "node:child_process"
+import { join } from "node:path"
+import { describe, expect, it } from "vitest"
+import { macCliRegistrationWarning, makeMacCliRegistration } from "./mac-cli-registration"
+import { makeMacCliPath } from "./mac-cli-path"
+
+const fixture = (test: (home: string, fs: FileSystem.FileSystem) => Effect.Effect<void, unknown, FileSystem.FileSystem>) =>
+  Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const home = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude fresh home ' " })
+    yield* test(home, fs)
+  })).pipe(Effect.provide(NodeContext.layer)))
+
+describe("user-owned Mac command PATH", () => {
+  it("preserves login profiles, is idempotent, and removes only its own text", () => fixture((home, fs) => Effect.gen(function* () {
+    const profile = join(home, ".profile")
+    const original = 'export MY_EXISTING_SETTING=yes'
+    yield* fs.writeFileString(profile, original)
+    const path = yield* makeMacCliPath(home, {})
+    yield* path.install
+    const installed = yield* fs.readFileString(profile)
+    yield* path.install
+    expect(yield* fs.readFileString(profile)).toBe(installed)
+    expect(yield* fs.exists(join(home, ".bash_profile"))).toBe(false)
+    yield* fs.writeFileString(profile, installed + '# added later\n')
+    yield* path.remove
+    expect(yield* fs.readFileString(profile)).toBe(original + '# added later\n')
+    yield* path.remove
+    expect(yield* fs.readFileString(profile)).toBe(original + '# added later\n')
+  })))
+
+  it("preserves an edited registration instead of deleting user content", () => fixture((home, fs) => Effect.gen(function* () {
+    const path = yield* makeMacCliPath(home, {})
+    yield* path.install
+    const file = join(home, ".zshrc")
+    const edited = (yield* fs.readFileString(file)).replace('export PATH=', 'export CUSTOM_PATH=')
+    yield* fs.writeFileString(file, edited)
+    expect((yield* Effect.either(path.remove))._tag).toBe("Left")
+    expect(yield* fs.readFileString(file)).toBe(edited)
+    expect(yield* fs.readFileString(join(home, ".bashrc"))).not.toContain("# >>> Magnitude CLI PATH >>>")
+  })))
+
+  it("removes its original login entry after a higher-priority profile is added", () => fixture((home, fs) => Effect.gen(function* () {
+    const original = "# original profile\n"
+    yield* fs.writeFileString(join(home, ".profile"), original)
+    yield* (yield* makeMacCliPath(home, {})).install
+    yield* fs.writeFileString(join(home, ".bash_profile"), "# added by user\n")
+    yield* (yield* makeMacCliPath(home, {})).remove
+    expect(yield* fs.readFileString(join(home, ".profile"))).toBe(original)
+    expect(yield* fs.readFileString(join(home, ".bash_profile"))).toBe("# added by user\n")
+  })))
+
+  it("respects custom zsh and fish configuration directories", () => fixture((home, fs) => Effect.gen(function* () {
+    const zdot = join(home, "zsh")
+    const config = join(home, "config")
+    const path = yield* makeMacCliPath(home, { ZDOTDIR: zdot, XDG_CONFIG_HOME: config, SHELL: "/opt/homebrew/bin/fish" })
+    yield* path.install
+    expect(yield* fs.exists(join(zdot, ".zshrc"))).toBe(true)
+    expect(yield* fs.exists(join(home, ".zshrc"))).toBe(false)
+    expect(yield* fs.readFileString(join(config, "fish/config.fish"))).toContain('fish_add_path --path --move --prepend')
+  })))
+
+  it.skipIf(process.platform !== "darwin")("real fresh login and interactive shells prefer the bundled CLI", () => fixture((home, fs) => Effect.gen(function* () {
+    const bin = join(home, ".magnitude/bin")
+    const target = join(home, "Magnitude.app/Contents/Resources/magnitude")
+    yield* fs.makeDirectory(join(target, ".."), { recursive: true })
+    yield* fs.writeFileString(target, '#!/bin/sh\nprintf "bundled-cli\\n"\n')
+    yield* fs.chmod(target, 0o755)
+    const registration = yield* makeMacCliRegistration({ home,
+      resourcesDirectory: join(target, ".."), environment: {} })
+    yield* registration.install
+    yield* registration.install
+    for (const shell of ["/bin/zsh", "/bin/bash"]) {
+      for (const mode of ["-lc", "-ic"]) {
+        const output = execFileSync(shell, [mode, 'command -v magnitude; magnitude'], {
+          cwd: home, env: { HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin", ZDOTDIR: home, TERM: "dumb" },
+          encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+        })
+        expect(output.trim().split("\n")).toEqual([join(bin, "magnitude"), "bundled-cli"])
+      }
+    }
+    yield* registration.remove
+    expect(yield* fs.exists(join(bin, "magnitude"))).toBe(false)
+  })))
+
+  it.skipIf(process.getuid?.() === 0)("an unwritable shell profile leaves installation finished, with a warning", () => fixture((home, fs) => Effect.gen(function* () {
+    // A root-owned ~/.zshrc, as on some cloud Macs.
+    const zshrc = join(home, ".zshrc")
+    yield* fs.writeFileString(zshrc, "# managed elsewhere\n")
+    yield* fs.chmod(zshrc, 0o444)
+    const registration = yield* makeMacCliRegistration({ home, resourcesDirectory: join(home, "Magnitude.app/Contents/Resources"), environment: {} })
+    const warning = yield* macCliRegistrationWarning(registration.install)
+    expect(Option.getOrThrow(warning)).toContain(`Warning: Could not update shell PATH in ${zshrc}:`)
+    expect(Option.getOrThrow(warning)).toContain("To use the magnitude command in a terminal, add ~/.magnitude/bin to your PATH.")
+    expect(yield* fs.readFileString(zshrc)).toBe("# managed elsewhere\n")
+    expect(yield* fs.readFileString(join(home, ".bash_profile"))).toContain("# >>> Magnitude CLI PATH >>>")
+    expect(yield* fs.readFileString(join(home, ".bashrc"))).toContain("# >>> Magnitude CLI PATH >>>")
+    expect(Option.isNone(yield* macCliRegistrationWarning(Effect.void))).toBe(true)
+  })))
+})

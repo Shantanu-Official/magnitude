@@ -1,0 +1,144 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Magnitude",
+  "theme": "linden",
+  "description": "Run open models as fast as your hardware allows",
+  "logo": {
+    "light": "/wordmark-black.svg",
+    "dark": "/wordmark-white.svg"
+  },
+  "favicon": "/logo.svg",
+  "fonts": {
+    "heading": {
+      "family": "Martian Mono",
+      "weight": 700
+    },
+    "body": {
+      "family": "Inter"
+    }
+  },
+  "colors": {
+    "primary": "#0369a1",
+    "light": "#0ea5e9",
+    "dark": "#0284c7"
+  },
+  "background": {
+    "color": {
+      "dark": "#0f1826"
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Join community",
+        "href": "https://discord.gg/EHt48pPWdC"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/magnitudedev/magnitude"
+    }
+  },
+  "navigation": {
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "icon": "github",
+          "href": "https://github.com/magnitudedev/magnitude"
+        },
+        {
+          "anchor": "Community",
+          "icon": "discord",
+          "href": "https://discord.gg/EHt48pPWdC"
+        },
+        {
+          "anchor": "Contact",
+          "icon": "mail",
+          "href": "mailto:founders@magnitude.dev"
+        }
+      ]
+    },
+    "pages": [
+      {
+        "group": "Get started",
+        "pages": [
+          "introduction",
+          "get-started",
+          "installation/macos",
+          "installation/windows",
+          "installation/linux",
+          "installation/docker",
+          "remote-server",
+          "hardware",
+          "models",
+          "settings"
+        ]
+      },
+      {
+        "group": "Connect your agent",
+        "pages": [
+          "integrations/overview",
+          "integrations/pi",
+          "integrations/opencode",
+          "integrations/hermes",
+          "integrations/openclaw",
+          "integrations/codex",
+          "integrations/claude-code",
+          "integrations/oh-my-pi",
+          "integrations/cline",
+          "integrations/other-agents"
+        ]
+      },
+      {
+        "group": "API",
+        "pages": [
+          "api/overview",
+          "api/endpoints",
+          "api/network-access",
+          "api/windows-wsl"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference",
+          "reference/configuration-file",
+          "troubleshooting",
+          "faq"
+        ]
+      }
+    ]
+  },
+  "redirects": [
+    {
+      "source": "/api/other-apps",
+      "destination": "/integrations/other-agents"
+    }
+  ],
+  "styling": {
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "github-dark"
+      }
+    }
+  },
+  "search": {
+    "prompt": "Search or ask..."
+  },
+  "seo": {
+    "indexing": "all"
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude"
+    ]
+  },
+  "icons": {
+    "library": "lucide"
+  }
+}

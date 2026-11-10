@@ -1,0 +1,56 @@
+// Exact GGUF -> resident conversion (the Seismic registry's registered
+// `repack`) into `rows16` storage, the Vulkan resident layout (spec §10.1).
+// E is the GGUF source, U the resident (representation, layout); the entry
+// sees every weight as a [B, N, K] view. The placement of each row tile is
+// lib/repack/repack.glsl's, the one expert streaming's slots are written by.
+//
+// Each workgroup (32 invocations) places one row tile: 16 rows x one unit of
+// the span's columns (`repack_tile_columns`), an invocation a row. The grid
+// holds a workgroup per unit; those past the row's units place nothing. The
+// result is a record port (bank records, chunked, import through it): matrix
+// b is written from its own record's base.
+#include <seismic/slab.glsl>
+#include "lib/repack/repack.glsl"
+
+#if !defined(SEISMIC_ELEMENT_E_KIND_EXTERNAL) || !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16)
+#error "repack_weight converts an external GGUF source into rows16 resident storage"
+#endif
+
+#if !defined(SEISMIC_CONVERSION_E_U)
+#error "repack_weight binding is not a registered GGUF-to-resident conversion"
+#endif
+
+// rows16 stores exactly the source's groups: every stored tile holds source
+// packets.
+#if SEISMIC_ELEMENT_U_GROUP_MULTIPLE != 1
+#error "rows16 stores no padding groups"
+#endif
+
+REPACK_TILE(repack, SEISMIC_CONVERSION_E_U, SEISMIC_ELEMENT_E, SEISMIC_RESULT_0)
+
+// Source packet `index` of row `n` of matrix `b`.
+uint64_t source_packet(uint64_t source, uint64_t b, uint64_t n, uint64_t index) {
+    return source
+        + (b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + index * SEISMIC_SOURCE_STRIDE_2)
+        * uint64_t(SEISMIC_ELEMENT_E_PACKET_SIZE);
+}
+
+// Start of stored row `n` of matrix `b`, from its record's base in the
+// result's record table.
+uint64_t row_base(uint64_t destination, uint64_t b, uint64_t n) {
+    return slab_region(destination, b) + n * SEISMIC_RESULT_0_STRIDE_1 * SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
+}
+
+void repack_weight() {
+    const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE);
+    const uint64_t destination = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint lane = gl_LocalInvocationID.x;
+    const uint64_t b = gl_WorkGroupID.z;
+    const uint64_t n = uint64_t(gl_WorkGroupID.y) * REPACK_TILE_ROWS + lane;
+    const uint column0 = gl_WorkGroupID.x * repack_tile_columns();
+    const uint64_t stored_columns = SEISMIC_RESULT_0_ROW_GROUPS * uint64_t(SEISMIC_ELEMENT_E_LOGICAL_GROUP);
+    if (lane >= REPACK_TILE_ROWS || n >= SEISMIC_DIM_N || column0 >= stored_columns)
+        return;
+    repack_place(source_packet(source, b, n, column0 / uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP)), row_base(destination, b, n),
+        column0);
+}

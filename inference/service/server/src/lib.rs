@@ -1,0 +1,34 @@
+//! The inference service's composition-root library: model assessment (the environment and its
+//! identity, the measurement job and the automatic assessment pool), model residency on the
+//! engine worker and its exclusion with the measurement job, the model store with the devices
+//! it serves, the shared resolved-configuration cache, the hardware endpoint's provider and
+//! contained child processes.
+
+pub mod assessment;
+pub mod build_identity;
+pub mod configurations;
+pub mod device_lock;
+mod dying_process;
+pub mod hardware;
+pub mod memory_domains;
+pub mod model_store;
+pub mod residency;
+pub mod serving;
+pub mod worker_process;
+
+/// Makes the token ACN configures at runtime the only Hugging Face credential ICN presents: the
+/// Hub client must never resolve one from the environment (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+/// `HF_TOKEN_PATH`) or the Hugging Face token file, and engine workers inherit none.
+///
+/// # Safety
+///
+/// Changes the process environment, so it must run before any other thread starts.
+pub unsafe fn isolate_hub_credentials() {
+    // SAFETY: the caller guarantees no other thread reads or writes the environment.
+    unsafe {
+        std::env::set_var("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1");
+        for name in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_TOKEN_PATH"] {
+            std::env::remove_var(name);
+        }
+    }
+}

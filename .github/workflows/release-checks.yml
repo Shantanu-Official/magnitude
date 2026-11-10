@@ -1,0 +1,98 @@
+name: Release checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_cpu_artifact_run_id:
+        description: Test Intel CPU inference using this existing release run (no builds or publication)
+        type: string
+        default: ''
+      macos_cpu_model:
+        description: Shipped catalog model for Intel CPU inference acceptance
+        type: choice
+        options:
+          - 'qwen3.5-4b:gguf:q4'
+        default: 'qwen3.5-4b:gguf:q4'
+      windows_distribution:
+        description: Validate Azure-signed Windows artifacts without publishing
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - ".changeset/**"
+      - ".github/workflows/**"
+      - "cli/**"
+      - "inference/**"
+      - "packages/**"
+      - "patches/**"
+      - "scripts/accept-release-candidate.ts"
+      - "scripts/release-target.ts"
+      - "scripts/tsconfig.release.json"
+      - "bun.lock"
+      - "package.json"
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.2"
+  RUST_VERSION: "1.91.1"
+  NPM_VERSION: "11.6.2"
+
+jobs:
+  macos-cpu-inference:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_cpu_artifact_run_id != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/release-inference-macos.yml
+    with:
+      artifact_run_id: ${{ inputs.macos_cpu_artifact_run_id }}
+      model: ${{ inputs.macos_cpu_model }}
+
+  integrations:
+    if: ${{ !inputs.macos_cpu_artifact_run_id }}
+    uses: ./.github/workflows/integrations.yml
+
+  static:
+    if: ${{ !inputs.macos_cpu_artifact_run_id }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: ./.github/actions/build-cache
+        with:
+          scope: static
+      - run: npm install --global "npm@${NPM_VERSION}"
+      - run: bun install --frozen-lockfile
+      - run: bun run icn:check-generated
+      - run: bun run --cwd packages/icn-protocol typecheck
+      - run: bun run --cwd packages/icn-protocol test
+      - run: bun run --cwd packages/release typecheck
+      - run: bun run --cwd cli typecheck
+      - run: bun run --cwd packages/sdk typecheck
+      - run: bun run --cwd packages/icn typecheck
+      - run: bun run --cwd packages/ripgrep prepare
+      - run: bun run --cwd packages/acn typecheck
+      - run: bunx tsc -p scripts/tsconfig.release.json
+      - run: bun run packages/release/scripts/matrix.ts
+
+  release-build:
+    if: ${{ !inputs.macos_cpu_artifact_run_id }}
+    permissions:
+      contents: read
+      id-token: write
+    needs: [static, integrations]
+    uses: ./.github/workflows/release-build.yml
+    with:
+      source_commit: ${{ github.sha }}
+      validate_candidate: true
+      windows_distribution: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_distribution }}

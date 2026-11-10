@@ -1,0 +1,5778 @@
+//! The opaque checked module (spec §3.2).
+//!
+//! Exactly two constructors exist, one per kind of input:
+//!
+//! - [`check_source`] parses and checks source text: files, the dynamic
+//!   API's inline source, development overrides, and the source section of a
+//!   bundle file that arrives from outside the binary
+//!   ([`crate::bundle::check_bundle_sources`]).
+//! - [`crate::bundle::decode_checked_bundle`] decodes the checked module a
+//!   bundle embedded by `seismic-build` carries: the output of the build's
+//!   checker, validated structurally and never re-checked.
+//!
+//! There is no struct literal, `Default`, deserializer outside the bundle
+//! decoder's context, arena mutation, or constructor that accepts
+//! already-typed nodes. Consumers read through accessors and obtain a
+//! [`LogicalEntry`] through [`CheckedModule::entry`], the only builder of
+//! entry semantics.
+//!
+//! W1 owns the internals behind `internals::Module`.
+
+use crate::device::DeviceValues;
+use crate::entry::{ElementBindings, LogicalEntry, ResultClass};
+use crate::ids::{EntryContent, EntryId, ModuleHash, RepresentationId, StableEntryId};
+use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKind};
+use crate::span::Span;
+use crate::types::DType;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::sync::Arc;
+
+/// One source file. Paths are diagnostic labels; they grant nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceFile {
+    pub path: String,
+    pub text: String,
+}
+
+/// The closed set of sources checked as one module.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SourceSet {
+    files: Vec<SourceFile>,
+}
+
+impl SourceSet {
+    pub fn new(files: Vec<SourceFile>) -> Self {
+        Self { files }
+    }
+
+    pub fn push(&mut self, file: SourceFile) {
+        self.files.push(file);
+    }
+
+    pub fn extend(&mut self, files: impl IntoIterator<Item = SourceFile>) {
+        self.files.extend(files);
+    }
+
+    pub fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
+
+    pub(crate) fn canonicalized(mut self) -> Result<Self, Diagnostics> {
+        for file in &mut self.files {
+            file.path = canonical_path(&file.path);
+        }
+        self.files.sort_by(|a, b| a.path.cmp(&b.path));
+        let diagnostics = self
+            .files
+            .windows(2)
+            .filter(|pair| pair[0].path == pair[1].path)
+            .map(|pair| {
+                SourceDiagnostic::new(
+                    &pair[1],
+                    Span::default(),
+                    DiagnosticRule::Resolution,
+                    "duplicate source path in one module",
+                )
+            })
+            .collect();
+        match Diagnostics::new(diagnostics) {
+            Some(diagnostics) => Err(diagnostics),
+            None => Ok(self),
+        }
+    }
+}
+
+fn canonical_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+    for component in normalized.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.last().is_some_and(|last| *last != "..") {
+                    components.pop();
+                } else if !absolute {
+                    components.push("..");
+                }
+            }
+            value => components.push(value),
+        }
+    }
+    let body = components.join("/");
+    if absolute { format!("/{body}") } else { body }
+}
+
+/// The language rule a diagnostic reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DiagnosticRule {
+    Syntax,
+    Resolution,
+    Type,
+    Ownership,
+    Initialization,
+    Independence,
+    CallContract,
+    Dimension,
+    Capability,
+    Placement,
+    Atomic,
+    Recursion,
+    NativeDeclaration,
+}
+
+impl DiagnosticRule {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Syntax => "Syntax",
+            Self::Resolution => "Resolution",
+            Self::Type => "Type",
+            Self::Ownership => "Ownership",
+            Self::Initialization => "Initialization",
+            Self::Independence => "Independence",
+            Self::CallContract => "CallContract",
+            Self::Dimension => "Dimension",
+            Self::Capability => "Capability",
+            Self::Placement => "Placement",
+            Self::Atomic => "Atomic",
+            Self::Recursion => "Recursion",
+            Self::NativeDeclaration => "NativeDeclaration",
+        }
+    }
+}
+
+impl std::fmt::Display for DiagnosticRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// One-based line and column (in characters) of a span's start in `text`.
+pub(crate) fn line_column(text: &str, span: Span) -> (u32, u32) {
+    let offset = (span.start as usize).min(text.len());
+    let before = &text[..offset];
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    let line = before.matches('\n').count() + 1;
+    let column = before[line_start..].chars().count() + 1;
+    (
+        u32::try_from(line).expect("source has more than u32::MAX lines"),
+        u32::try_from(column).expect("source line has more than u32::MAX characters"),
+    )
+}
+
+/// Where a diagnostic is anchored: a span of one source file, with its
+/// one-based line and column and the text of that line.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceLocation {
+    pub path: String,
+    pub span: Span,
+    pub line: u32,
+    pub column: u32,
+    source_line: String,
+}
+
+impl SourceLocation {
+    fn new(file: &SourceFile, span: Span) -> Self {
+        let (line, column) = line_column(&file.text, span);
+        let source_line = file
+            .text
+            .lines()
+            .nth(line as usize - 1)
+            .unwrap_or("")
+            .to_owned();
+        Self {
+            path: file.path.clone(),
+            span,
+            line,
+            column,
+            source_line,
+        }
+    }
+
+    /// The source line containing the span's start.
+    pub fn source_line(&self) -> &str {
+        &self.source_line
+    }
+}
+
+/// One diagnostic anchored in source.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceDiagnostic {
+    pub location: SourceLocation,
+    pub rule: DiagnosticRule,
+    pub message: String,
+}
+
+impl SourceDiagnostic {
+    pub(crate) fn new(
+        file: &SourceFile,
+        span: Span,
+        rule: DiagnosticRule,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            location: SourceLocation::new(file, span),
+            rule,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn located(file: &SourceFile, diagnostic: crate::span::Diagnostic) -> Self {
+        Self::new(file, diagnostic.span, diagnostic.rule, diagnostic.message)
+    }
+}
+
+impl std::fmt::Display for SourceDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let location = &self.location;
+        write!(
+            f,
+            "{}:{}:{}: {}: {}",
+            location.path, location.line, location.column, self.rule, self.message
+        )?;
+        let line = location.source_line();
+        let before = location.column as usize - 1;
+        let span_bytes = location.span.end.saturating_sub(location.span.start) as usize;
+        let start = line
+            .char_indices()
+            .nth(before)
+            .map_or(line.len(), |(offset, _)| offset);
+        let width = line[start..]
+            .char_indices()
+            .take_while(|(offset, _)| *offset < span_bytes)
+            .count()
+            .max(1);
+        write!(
+            f,
+            "\n  {line}\n  {}{}",
+            " ".repeat(before),
+            "^".repeat(width)
+        )
+    }
+}
+
+/// A non-empty, ordered, deduplicated set of diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostics {
+    items: Vec<SourceDiagnostic>,
+}
+
+impl Diagnostics {
+    /// Orders the items by path, span, rule and message, and drops repeated
+    /// items. Sorting on the whole key makes equal items adjacent.
+    pub(crate) fn new(mut items: Vec<SourceDiagnostic>) -> Option<Self> {
+        items.sort_by(|left, right| {
+            (
+                &left.location.path,
+                left.location.span.start,
+                left.location.span.end,
+                left.rule,
+                &left.message,
+            )
+                .cmp(&(
+                    &right.location.path,
+                    right.location.span.start,
+                    right.location.span.end,
+                    right.rule,
+                    &right.message,
+                ))
+        });
+        items.dedup();
+        (!items.is_empty()).then_some(Self { items })
+    }
+
+    pub fn items(&self) -> &[SourceDiagnostic] {
+        &self.items
+    }
+
+    pub(crate) fn single(item: SourceDiagnostic) -> Self {
+        Self { items: vec![item] }
+    }
+}
+
+/// A rejected source set: every diagnostic the checker produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceError {
+    diagnostics: Diagnostics,
+}
+
+impl SourceError {
+    pub(crate) fn new(diagnostics: Diagnostics) -> Self {
+        Self { diagnostics }
+    }
+
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
+    }
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (ordinal, item) in self.diagnostics.items().iter().enumerate() {
+            if ordinal > 0 {
+                f.write_str("\n")?;
+            }
+            write!(f, "{item}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SourceError {}
+
+/// Reads a native implementation's source, includes inlined, given its
+/// entry's name and its declaration (`declared_in`, `source_path`,
+/// `backend`): `None` when no source is given for it.
+pub type NativeReader<'a, E> =
+    dyn FnMut(&str, &NativeImplementation) -> Result<Option<Cow<'static, str>>, E> + 'a;
+
+/// The native sources a module holds, by entry and backend.
+pub(crate) type NativeSources = std::collections::BTreeMap<(EntryId, BackendName), Cow<'static, str>>;
+
+/// Why a source set fails to check with its native sources.
+#[derive(Debug)]
+pub enum CheckFailure<E> {
+    /// The sources, a native source among them, do not check.
+    Source(SourceError),
+    /// Reading a native source failed.
+    Read(E),
+}
+
+/// Parses and checks a source set as one closed module, with no native
+/// source: an implementation whose launches take code parameters from its
+/// source (a launch-scoped Metal or CUDA implementation) does not check
+/// without it ([`check_source_with`]).
+pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
+    check_source_with(sources, &mut |_entry: &str, _native: &NativeImplementation| {
+        Ok::<_, std::convert::Infallible>(None)
+    })
+    .map_err(|failure| match failure {
+        CheckFailure::Source(error) => error,
+        CheckFailure::Read(never) => match never {},
+    })
+}
+
+/// Parses and checks a source set as one closed module, reading each native
+/// implementation's source with `read`: which of its parameters change
+/// generated code is derived from the source read, and every declared
+/// parameter must be read by it or by the declaration. The only
+/// source-side constructor of a [`CheckedModule`].
+pub fn check_source_with<E>(
+    sources: SourceSet,
+    read: &mut NativeReader<'_, E>,
+) -> Result<CheckedModule, CheckFailure<E>> {
+    let sources = sources
+        .canonicalized()
+        .map_err(|diagnostics| CheckFailure::Source(SourceError::new(diagnostics)))?;
+    let (module, assets) = internals::check(sources, read)?;
+    let mut checked = CheckedModule::decoded(module);
+    checked.assets = assets;
+    Ok(checked)
+}
+
+/// A native implementation's source, includes expanded, and the constants of
+/// its module: a rendered source defines `SEISMIC_CONST_NAME` for each it
+/// names.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAsset<'a> {
+    pub text: &'a str,
+    pub constants: &'a [(String, u64)],
+}
+
+/// An opaque checked semantic object: source semantics, types, effects,
+/// canonical bodies, lowering declarations, capability requirements, and
+/// stable identities. It decides nothing about targets, schedules,
+/// allocations, or native code (§2.1).
+#[derive(Clone, Debug)]
+pub struct CheckedModule {
+    inner: Arc<internals::Module>,
+    /// Native asset sources, borrowed from the bundle a build embedded
+    /// (`decode_checked_bundle`), so a process holds none of them on its
+    /// heap: they are most of a bundle, and a process reads one backend's.
+    pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), Cow<'static, str>>,
+    /// Each native implementation's declarations at element bindings, one
+    /// per combination of the values of the element reads it makes, formed
+    /// when first asked for (`native_implementation_at`).
+    bound: Arc<[std::sync::OnceLock<BoundImplementation>]>,
+}
+
+/// A native implementation's declarations at element bindings: one per
+/// combination of the values of its element reads (`operands(W)`,
+/// `form(W, NAME)`). Digit i of a slot's index, in base
+/// `values[i].len()`, is the position of `reads[i]`'s value in `values[i]`,
+/// every value it takes over the registry's representations.
+#[derive(Debug)]
+struct BoundImplementation {
+    reads: Vec<(String, ElementQuery)>,
+    values: Vec<Vec<u64>>,
+    slots: Vec<std::sync::OnceLock<NativeImplementation>>,
+}
+
+impl CheckedModule {
+    /// Content-derived semantic hash; the cache identity of this module.
+    pub fn semantic_hash(&self) -> ModuleHash {
+        self.inner.semantic_hash()
+    }
+
+    /// The module constants (`const NAME = INTEGER`), in source order: every
+    /// native reads each as `SEISMIC_CONST_NAME`, and the generated Rust API
+    /// exports them.
+    pub fn constants(&self) -> &[(String, u64)] {
+        &self.inner.constants
+    }
+
+    /// Every exported entry, in declaration order.
+    pub fn entries(&self) -> &[EntryInfo] {
+        self.inner.entries()
+    }
+
+    pub fn entry_named(&self, name: &str) -> Option<EntryId> {
+        self.inner
+            .entries()
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.id)
+    }
+
+    /// The explicitly authored top-level native implementation for an entry
+    /// and backend, when one exists.
+    pub fn native_implementation(
+        &self,
+        entry: EntryId,
+        backend: BackendName,
+    ) -> Option<&NativeImplementation> {
+        self.inner
+            .native_implementations
+            .iter()
+            .find(|native| native.entry == entry && native.backend == backend)
+    }
+
+    /// The native implementation of an entry for a backend at element
+    /// bindings `bindings`, every element read substituted: formed once per
+    /// combination of the values it reads, and shared by every caller
+    /// after. `None` when the backend has none, or it does not form at
+    /// `bindings` ([`NativeImplementation::at_elements`]).
+    pub fn native_implementation_at(
+        &self,
+        entry: EntryId,
+        backend: BackendName,
+        bindings: &ElementBindings,
+    ) -> Option<&NativeImplementation> {
+        let index = self
+            .inner
+            .native_implementations
+            .iter()
+            .position(|native| native.entry == entry && native.backend == backend)?;
+        let native = &self.inner.native_implementations[index];
+        let bound = self.bound[index].get_or_init(|| {
+            let reads = native.element_reads();
+            let values = reads
+                .iter()
+                .map(|(_, query)| query.values())
+                .collect::<Vec<_>>();
+            let slots = (0..values.iter().map(Vec::len).product::<usize>())
+                .map(|_| std::sync::OnceLock::new())
+                .collect();
+            BoundImplementation {
+                reads,
+                values,
+                slots,
+            }
+        });
+        if bound.reads.is_empty() {
+            return Some(native);
+        }
+        let mut slot = 0usize;
+        for ((element, query), values) in bound.reads.iter().zip(&bound.values) {
+            let representation = bindings
+                .get(element)
+                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
+            let digit = values
+                .binary_search(&query.of(representation)?)
+                .expect("a query's values hold each value it has");
+            slot = slot * values.len() + digit;
+        }
+        Some(bound.slots[slot].get_or_init(|| {
+            native
+                .at_elements(bindings)
+                .expect("every element read has a value at these bindings")
+        }))
+    }
+
+    /// Builds the monomorphized semantics of one entry under one set of
+    /// compile-time element bindings. This is the only constructor of
+    /// `LogicalEntry` (§3.4). An entry with no element parameters takes
+    /// `ElementBindings::default()`.
+    pub fn entry(
+        &self,
+        entry: EntryId,
+        bindings: &ElementBindings,
+    ) -> Result<LogicalEntry, SourceError> {
+        self.inner.entry(entry, bindings)
+    }
+
+    /// Attach the native asset of a decoded bundle's implementation for one
+    /// backend: a decoded bundle's implementations hold the code parameters
+    /// derived when its sources were checked.
+    pub(crate) fn capture_native_asset(
+        &mut self,
+        entry: EntryId,
+        backend: BackendName,
+        source: Cow<'static, str>,
+    ) -> Result<(), String> {
+        if self.native_implementation(entry, backend).is_none() {
+            return Err(format!(
+                "entry `{}` has no native implementation for `{}`",
+                self.entries()[entry.index()].name,
+                backend.as_str()
+            ));
+        }
+        self.assets.insert((entry, backend), source);
+        Ok(())
+    }
+
+    /// The native source `entry` declares for `backend`, with the module
+    /// constants its rendered prefix defines.
+    pub fn native_asset(&self, entry: EntryId, backend: BackendName) -> Option<NativeAsset<'_>> {
+        self.assets.get(&(entry, backend)).map(|source| NativeAsset {
+            text: source,
+            constants: self.constants(),
+        })
+    }
+
+    /// The source set this module was checked from, for diagnostics and
+    /// build-script fingerprinting only.
+    pub fn sources(&self) -> &SourceSet {
+        self.inner.sources()
+    }
+
+    pub(crate) fn internal(&self) -> &internals::Module {
+        &self.inner
+    }
+
+    /// The bundle decoder's constructor: a module the build's checker
+    /// produced, decoded and structurally validated by
+    /// [`crate::bundle::decode_checked_bundle`].
+    pub(crate) fn decoded(inner: internals::Module) -> Self {
+        let bound = inner
+            .native_implementations
+            .iter()
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        Self {
+            inner: Arc::new(inner),
+            assets: Default::default(),
+            bound,
+        }
+    }
+}
+
+/// Summary of one entry sufficient for binding generation before
+/// monomorphization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryInfo {
+    pub id: EntryId,
+    pub stable: StableEntryId,
+    /// What the entry's meaning depends on and nothing else
+    /// ([`EntryContent`]): what identifies its implementation across
+    /// modules, where its stable identity names its whole module.
+    pub content: EntryContent,
+    pub name: String,
+    /// Shape dimensions, in contract order: each inferred at a call, or
+    /// `static` (bound by its specialization).
+    pub dimensions: Vec<String>,
+    /// Compile-time element parameters (`T`, `U`) an entry is polymorphic in.
+    pub element_parameters: Vec<String>,
+    /// Complete source structure, including unit values, for dynamic callers.
+    pub parameter_types: Vec<(String, SignatureType)>,
+    pub result_type: SignatureType,
+    pub parameters: Vec<ParameterSummary>,
+    pub results: Vec<ResultSummary>,
+    /// The admissible bindings of the element parameters.
+    pub element_domain: ElementDomain,
+}
+
+/// The admissible bindings of an entry's element parameters, computed by the
+/// checker. The only owner of binding legality.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementDomain {
+    parameters: Vec<ElementParameter>,
+    conversions: Vec<ElementConversion>,
+    predicates: Vec<ElementPredicate>,
+}
+
+/// One element parameter and every use the entry makes of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementParameter {
+    pub name: String,
+    pub uses: ElementUses,
+}
+
+/// How an entry uses the elements of one element parameter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ElementUses {
+    pub decoded_read: bool,
+    /// A logical component of the registered packed decode recipe.
+    pub component_read: bool,
+    /// The component additionally requires an interpreted integer code.
+    pub integer_code_read: bool,
+    pub stored: bool,
+    /// A `&mut` parameter, or a store of whole trailing matrices
+    /// (`registry::record_writable`).
+    pub record_stored: bool,
+    pub conversion_source: bool,
+    /// `to_owned` of a view selecting part of the packing axis.
+    pub partial_copy: bool,
+}
+
+/// `repack[U = target](t)` with `t: tensor[..] source`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementConversion {
+    pub source: String,
+    pub target: ElementTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementTarget {
+    Parameter(String),
+    Concrete(RepresentationId),
+}
+
+/// A `where` conjunct over the elements' operand recipes
+/// (`operands(QW) == operands(KW)`, `operands(RW) == 0`): decided when the
+/// elements are bound, so a binding outside it is not an entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementPredicate {
+    /// `==` when true, `!=` when false.
+    pub equal: bool,
+    pub left: ElementTerm,
+    pub right: ElementTerm,
+}
+
+/// A term of an [`ElementPredicate`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementTerm {
+    /// The operand recipe code of the representation the element parameter
+    /// is bound to.
+    Operands(String),
+    Constant(u64),
+}
+
+impl ElementTerm {
+    fn value(&self, bound: impl Fn(&str) -> RepresentationId) -> u64 {
+        match self {
+            Self::Operands(parameter) => registry::representation_info(bound(parameter))
+                .operands
+                .code(),
+            Self::Constant(value) => *value,
+        }
+    }
+}
+
+impl std::fmt::Display for ElementTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operands(parameter) => write!(f, "operands({parameter})"),
+            Self::Constant(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ElementPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let comparison = if self.equal { "==" } else { "!=" };
+        write!(f, "{} {comparison} {}", self.left, self.right)
+    }
+}
+
+/// Element bindings outside an entry's [`ElementDomain`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElementBindingError {
+    Missing {
+        parameter: String,
+    },
+    Unexpected {
+        parameter: String,
+    },
+    Inadmissible {
+        parameter: String,
+        representation: RepresentationId,
+        uses: ElementUses,
+    },
+    NoConversion {
+        source: RepresentationId,
+        target: RepresentationId,
+    },
+    Excluded {
+        predicate: ElementPredicate,
+    },
+}
+
+impl std::fmt::Display for ElementBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name =
+            |representation: &RepresentationId| registry::representation_info(*representation).name;
+        match self {
+            Self::Missing { parameter } => {
+                write!(f, "element parameter `{parameter}` is not bound")
+            }
+            Self::Unexpected { parameter } => {
+                write!(f, "`{parameter}` is not an element parameter of this entry")
+            }
+            Self::Inadmissible {
+                parameter,
+                representation,
+                uses,
+            } => write!(
+                f,
+                "representation `{}` is not admissible for element parameter `{parameter}` ({uses:?})",
+                name(representation)
+            ),
+            Self::NoConversion { source, target } => write!(
+                f,
+                "no exact representation conversion is registered from `{}` to `{}`",
+                name(source),
+                name(target)
+            ),
+            Self::Excluded { predicate } => {
+                write!(f, "the bindings do not hold `where {predicate}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ElementBindingError {}
+
+impl ElementUses {
+    /// Adds every use of `other`: the uses of a parameter seen through two
+    /// paths are the union of each path's.
+    pub fn merge(&mut self, other: ElementUses) {
+        let ElementUses {
+            decoded_read,
+            component_read,
+            integer_code_read,
+            stored,
+            record_stored,
+            conversion_source,
+            partial_copy,
+        } = other;
+        self.decoded_read |= decoded_read;
+        self.component_read |= component_read;
+        self.integer_code_read |= integer_code_read;
+        self.stored |= stored;
+        self.record_stored |= record_stored;
+        self.conversion_source |= conversion_source;
+        self.partial_copy |= partial_copy;
+    }
+
+    /// Whether an element parameter with these uses may be bound to `representation`.
+    pub fn admits(self, representation: RepresentationId) -> bool {
+        let info = registry::representation_info(representation);
+        let dense_float = matches!(
+            info.kind,
+            RepresentationKind::Dense(DType::F32 | DType::F16 | DType::BF16)
+        );
+        let decodable = dense_float
+            || (matches!(
+                info.kind,
+                RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_)
+            ) && registry::decode_recipe(representation, DType::F32).is_some());
+        info.decoded.is_float()
+            && (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense_float))
+            && (!self.record_stored || registry::record_writable(representation))
+            && (!self.decoded_read
+                || (matches!(
+                    info.access,
+                    RepresentationAccess::ReadWrite | RepresentationAccess::ReadOnly
+                ) && decodable))
+            && (!self.component_read
+                || registry::decode_recipe(representation, DType::F32).is_some())
+            && (!self.integer_code_read
+                || registry::decode_recipe(representation, DType::F32).is_some_and(|recipe| {
+                    recipe
+                        .component(registry::QuantizedComponent::Code)
+                        .is_some()
+                }))
+            && (!self.partial_copy || matches!(info.kind, RepresentationKind::Dense(_)))
+    }
+}
+
+impl ElementDomain {
+    pub(crate) fn new(
+        parameters: Vec<ElementParameter>,
+        conversions: Vec<ElementConversion>,
+        predicates: Vec<ElementPredicate>,
+    ) -> Self {
+        Self {
+            parameters,
+            conversions,
+            predicates,
+        }
+    }
+
+    pub fn parameters(&self) -> &[ElementParameter] {
+        &self.parameters
+    }
+
+    pub fn conversions(&self) -> &[ElementConversion] {
+        &self.conversions
+    }
+
+    pub fn predicates(&self) -> &[ElementPredicate] {
+        &self.predicates
+    }
+
+    /// Whether element parameter `name` is a weight the entry only reads:
+    /// neither stored nor copied, not a conversion's target, and not only a
+    /// conversion's source (a CPU form's weight operand).
+    pub fn read_as_weight(&self, name: &str) -> bool {
+        let converted = self
+            .conversions
+            .iter()
+            .any(|conversion| conversion.target == ElementTarget::Parameter(name.to_owned()));
+        self.parameters
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .is_some_and(|parameter| {
+                let uses = parameter.uses;
+                !converted
+                    && !(uses.stored || uses.partial_copy)
+                    && !(uses.conversion_source && !uses.decoded_read)
+            })
+    }
+
+    /// Whether parameter names are unique and every conversion and predicate
+    /// names its own parameters, as the checker constructs every domain. A
+    /// decoded domain is used only once this holds.
+    pub(crate) fn well_formed(&self) -> bool {
+        let named = |name: &str| {
+            self.parameters
+                .iter()
+                .filter(|parameter| parameter.name == name)
+                .count()
+                == 1
+        };
+        self.parameters.iter().all(|parameter| named(&parameter.name))
+            && self.conversions.iter().all(|conversion| {
+                named(&conversion.source)
+                    && match &conversion.target {
+                        ElementTarget::Parameter(name) => named(name),
+                        ElementTarget::Concrete(_) => true,
+                    }
+            })
+            && self.predicates.iter().all(|predicate| {
+                [&predicate.left, &predicate.right]
+                    .into_iter()
+                    .all(|term| match term {
+                        ElementTerm::Operands(name) => named(name),
+                        ElementTerm::Constant(_) => true,
+                    })
+            })
+    }
+
+    /// Decides whether `bindings` bind exactly this domain's parameters to
+    /// admissible representations with every required conversion registered
+    /// and every element predicate holding.
+    pub fn admit(&self, bindings: &ElementBindings) -> Result<(), ElementBindingError> {
+        for parameter in &self.parameters {
+            if bindings.get(&parameter.name).is_none() {
+                return Err(ElementBindingError::Missing {
+                    parameter: parameter.name.clone(),
+                });
+            }
+        }
+        for (name, _) in bindings.iter() {
+            if !self
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == name)
+            {
+                return Err(ElementBindingError::Unexpected {
+                    parameter: name.to_owned(),
+                });
+            }
+        }
+        let bound = |name: &str| {
+            bindings
+                .get(name)
+                .expect("element domain names a parameter outside its own parameter list")
+        };
+        for parameter in &self.parameters {
+            let representation = bound(&parameter.name);
+            if !parameter.uses.admits(representation) {
+                return Err(ElementBindingError::Inadmissible {
+                    parameter: parameter.name.clone(),
+                    representation,
+                    uses: parameter.uses,
+                });
+            }
+        }
+        for conversion in &self.conversions {
+            let source = bound(&conversion.source);
+            let target = match &conversion.target {
+                ElementTarget::Parameter(name) => bound(name),
+                ElementTarget::Concrete(representation) => *representation,
+            };
+            if registry::representation_conversion(source, target).is_none()
+                && registry::dense_conversion(source, target).is_none()
+            {
+                return Err(ElementBindingError::NoConversion { source, target });
+            }
+        }
+        self.hold(bindings)
+    }
+
+    /// Decides whether this domain's element predicates hold at `bindings`,
+    /// which bind every parameter.
+    pub fn hold(&self, bindings: &ElementBindings) -> Result<(), ElementBindingError> {
+        let bound = |name: &str| {
+            bindings
+                .get(name)
+                .expect("an element predicate names a bound parameter")
+        };
+        for predicate in &self.predicates {
+            if (predicate.left.value(bound) == predicate.right.value(bound)) != predicate.equal {
+                return Err(ElementBindingError::Excluded {
+                    predicate: predicate.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read-only signature structure projected from checked source types.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignatureType {
+    Unit,
+    Tuple(Vec<SignatureType>),
+    Tensor {
+        access: TensorAccess,
+        rank: u32,
+        element: ElementSummary,
+    },
+    Scalar(DType),
+    Index,
+    Range,
+}
+
+/// One direct top-level native implementation attached to a checked entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeImplementation {
+    pub entry: EntryId,
+    pub backend: BackendName,
+    /// Canonical module source label containing the declaration.
+    pub declared_in: String,
+    /// The native source path, relative to the declaring source file.
+    pub source_path: String,
+    /// Entry dimensions whose values are fixed when the implementation is
+    /// prepared, in declaration order.
+    pub statics: Vec<String>,
+    /// Tuning parameters, in declaration order.
+    pub params: Vec<NativeParameter>,
+    /// On CPU, the dense element types the form is compiled for, for element
+    /// parameters that do not take the default (`f32`, `bf16`, `f16`).
+    pub elements: Vec<NativeElementCoverage>,
+    /// Tensor ports bound through a table of their records' device
+    /// addresses (`records`) by every launch without its own.
+    pub records: Vec<RecordPort>,
+    /// The launches that list their own record ports in place of
+    /// `records`, by ordinal, in order ([`Self::launch_records`]). Launches
+    /// of one kernel list the same.
+    pub launch_records: Vec<(usize, Vec<RecordPort>)>,
+    /// The `where` condition restricting admissible parameter
+    /// configurations. It reads only static dimensions, parameters and the
+    /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`), whose reads make the
+    /// configurations the implementation's at its bindings
+    /// ([`Self::at_elements`]).
+    pub constraint: Option<NativeCondition>,
+    /// Call-private scratch buffers, in ABI order.
+    pub scratch: Vec<NativeScratch>,
+    /// Ordered dispatches of one call. Never empty.
+    pub launches: Vec<NativeLaunch>,
+    /// The launches a call dispatches more than once.
+    pub repeat: Option<NativeRepeat>,
+}
+
+/// Consecutive launches a call dispatches in order `count` times, each round
+/// with the call's one set of arguments: a kernel learns its round from
+/// scratch the launches themselves advance. A count of zero dispatches none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRepeat {
+    /// Ordinal of the block's first launch.
+    pub first: usize,
+    /// Number of launches in the block.
+    pub launches: usize,
+    /// Reads entry dimensions and entry parameters.
+    pub count: NativeNatExpr,
+}
+
+/// A native implementation bound to a device: it reads no `device.NAME`
+/// (each read is the device's value), so its defaults are the device's.
+/// Only binding makes one ([`NativeImplementation::at_device`], or
+/// [`NativeImplementation::device_independent`] for an implementation that
+/// reads no device property), so a default is never computed for an
+/// implementation whose defaults depend on a device it is not bound to.
+/// `I` holds the implementation: owned ([`OnDevice`]) or borrowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceBound<I = NativeImplementation>(I);
+
+/// A bound implementation that owns its declaration.
+pub type OnDevice = DeviceBound<NativeImplementation>;
+
+impl<I: std::borrow::Borrow<NativeImplementation>> std::ops::Deref for DeviceBound<I> {
+    type Target = NativeImplementation;
+    fn deref(&self) -> &NativeImplementation {
+        self.0.borrow()
+    }
+}
+
+impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
+    /// Each parameter's default at the static dimensions `dimension`
+    /// supplies, in declaration order: the implementation's own, then each
+    /// launch's.
+    pub fn parameter_defaults(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeSpecializationError> {
+        let implementation = self.implementation();
+        implementation
+            .params
+            .iter()
+            .chain(implementation.launches.iter().flat_map(|launch| &launch.params))
+            .map(|parameter| parameter.default.value(&parameter.name, &parameter.values, dimension))
+            .collect()
+    }
+
+    /// The bound implementation.
+    pub fn implementation(&self) -> &NativeImplementation {
+        self.0.borrow()
+    }
+
+    /// The bound implementation, owning its declaration.
+    pub fn owned(&self) -> OnDevice {
+        DeviceBound(self.0.borrow().clone())
+    }
+
+    /// The bound implementation at `bindings`
+    /// ([`NativeImplementation::at_elements`]), still bound: substituting
+    /// element reads reads no device. `None` where it does not form.
+    pub fn at_elements(&self, bindings: &ElementBindings) -> Option<OnDevice> {
+        self.0.borrow().at_elements(bindings).map(DeviceBound)
+    }
+
+    /// The default configuration at the given static values: every
+    /// parameter at its declared default when that configuration is
+    /// admissible; otherwise the first admissible configuration of the walk
+    /// in which each parameter tries its default before its other values,
+    /// in declaration order. `Inadmissible` exactly when the statics lie
+    /// outside the implementation's domain; `Default` when a default has
+    /// no value at them.
+    pub fn default_specialization(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        let implementation = self.implementation();
+        if let Some(name) = implementation
+            .statics
+            .iter()
+            .find(|name| statics.static_value(name).is_none())
+        {
+            return Err(NativeSpecializationError::MissingStatic(name.clone()));
+        }
+        let ordered = implementation.defaults_first(statics)?;
+        let mut first = None;
+        ordered.as_ref().walk_admissible(statics, |configuration| {
+            first = Some(configuration.clone());
+            false
+        })?;
+        first.ok_or(NativeSpecializationError::Inadmissible)
+    }
+}
+
+impl OnDevice {
+    /// The implementation with every parameter's default resolved at
+    /// `statics` and stated as its value: a change to the parameters'
+    /// listed values ([`Self::adjusted`]) then keeps each default where
+    /// its declaration put it, whatever `least` or `greatest` would pick
+    /// over the new values.
+    pub fn with_defaults_at(
+        mut self,
+        statics: &NativeSpecialization,
+    ) -> Result<Self, NativeSpecializationError> {
+        let dimension = |name: &str| statics.static_value(name);
+        let implementation = &mut self.0;
+        for parameter in implementation
+            .params
+            .iter_mut()
+            .chain(implementation.launches.iter_mut().flat_map(|launch| &mut launch.params))
+        {
+            let value = parameter.default.value(&parameter.name, &parameter.values, &dimension)?;
+            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+        }
+        Ok(self)
+    }
+
+    pub fn into_implementation(self) -> NativeImplementation {
+        self.0
+    }
+
+    /// The bound implementation changed by `change`, which narrows or
+    /// widens its parameters' domains (a fixed parameter, a survey's
+    /// widened values). A change never introduces a `device.NAME` read; one
+    /// that did is an invariant violation.
+    pub fn adjusted<E>(
+        mut self,
+        change: impl FnOnce(&mut NativeImplementation) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        change(&mut self.0)?;
+        assert!(
+            !self.0.reads_device(),
+            "a change to a bound implementation introduced a device read"
+        );
+        Ok(self)
+    }
+}
+
+impl NativeImplementation {
+    /// The implementation as formed at `bindings`: every element read
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`) is its value for the representation
+    /// `W` is bound to. The checker admits element reads only over the
+    /// entry's element parameters, and a formation binds every one of them.
+    /// `None` when a read has no value at its binding (`unit_columns(U)`
+    /// with `U` bound to no conversion's packed destination): the
+    /// implementation does not form there.
+    pub fn at_elements(&self, bindings: &ElementBindings) -> Option<Self> {
+        let value = |element: &str, query: ElementQuery| {
+            let representation = bindings
+                .get(element)
+                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
+            query.of(representation)
+        };
+        let unformed = std::cell::Cell::new(false);
+        let formed = self.at_codes(&|element: &str, query: ElementQuery| {
+            value(element, query).unwrap_or_else(|| {
+                unformed.set(true);
+                0
+            })
+        });
+        (!unformed.get()).then_some(formed)
+    }
+
+    /// The implementation on a device: every `device.NAME` read is that
+    /// device's value. Every name an implementation reads is one its
+    /// backend provides (the checker admits no other), so every read has a
+    /// value.
+    pub fn at_device(&self, device: &dyn DeviceValues) -> OnDevice {
+        let read = |name: &str| NativeNatExpr::Constant(device.value(name));
+        DeviceBound(self.mapped(
+            &|expression: &NativeNatExpr| expression.with_device(&read),
+            &|condition: &NativeCondition| condition.with_device(&read),
+        ))
+    }
+
+    /// The implementation as every device offers it, when it reads no
+    /// `device.NAME`: its defaults are then the same on every device.
+    /// `None` when it reads one; it is then bound only on a device
+    /// ([`Self::at_device`]).
+    pub fn device_independent(&self) -> Option<DeviceBound<&Self>> {
+        (!self.reads_device()).then_some(DeviceBound(self))
+    }
+
+    /// Whether any expression or condition of the implementation reads
+    /// `device.NAME`.
+    fn reads_device(&self) -> bool {
+        // Both visitors collect into one list.
+        let reads = std::cell::RefCell::new(Vec::new());
+        self.visit(
+            &mut |expression: &NativeNatExpr| expression.device_reads(&mut reads.borrow_mut()),
+            &mut |condition: &NativeCondition| condition.device_reads(&mut reads.borrow_mut()),
+        );
+        !reads.into_inner().is_empty()
+    }
+
+    /// Visit every expression and condition the implementation holds, its
+    /// parameters' defaults among them: the fields [`Self::mapped`] maps.
+    fn visit(
+        &self,
+        expression: &mut impl FnMut(&NativeNatExpr),
+        condition: &mut impl FnMut(&NativeCondition),
+    ) {
+        fn parameter(
+            parameter: &NativeParameter,
+            expression: &mut dyn FnMut(&NativeNatExpr),
+            condition: &mut dyn FnMut(&NativeCondition),
+        ) {
+            match &parameter.default {
+                NativeDefault::Value(value) => expression(value),
+                NativeDefault::Least(bound) | NativeDefault::Greatest(bound) => condition(bound),
+            }
+        }
+        for declared in &self.params {
+            parameter(declared, &mut *expression, &mut *condition);
+        }
+        self.constraint.iter().for_each(&mut *condition);
+        for scratch in &self.scratch {
+            expression(&scratch.bytes);
+            scratch.when.iter().for_each(&mut *condition);
+        }
+        for launch in &self.launches {
+            for declared in &launch.params {
+                parameter(declared, &mut *expression, &mut *condition);
+            }
+            launch.when.iter().for_each(&mut *condition);
+            launch.groups.iter().for_each(&mut *expression);
+            launch.group_extent.iter().for_each(&mut *expression);
+            expression(&launch.shared_bytes);
+        }
+        if let Some(repeat) = &self.repeat {
+            expression(&repeat.count);
+        }
+    }
+
+    /// The implementation with every expression and condition it holds,
+    /// its parameters' defaults among them, replaced by its image.
+    fn mapped(
+        &self,
+        expression: &impl Fn(&NativeNatExpr) -> NativeNatExpr,
+        condition: &impl Fn(&NativeCondition) -> NativeCondition,
+    ) -> Self {
+        let parameter = |parameter: &NativeParameter| NativeParameter {
+            default: parameter.default.mapped(expression, condition),
+            ..parameter.clone()
+        };
+        Self {
+            params: self.params.iter().map(parameter).collect(),
+            constraint: self.constraint.as_ref().map(condition),
+            scratch: self
+                .scratch
+                .iter()
+                .map(|scratch| NativeScratch {
+                    bytes: expression(&scratch.bytes),
+                    when: scratch.when.as_ref().map(condition),
+                    ..scratch.clone()
+                })
+                .collect(),
+            launches: self
+                .launches
+                .iter()
+                .map(|launch| NativeLaunch {
+                    params: launch.params.iter().map(parameter).collect(),
+                    when: launch.when.as_ref().map(condition),
+                    groups: launch.groups.each_ref().map(expression),
+                    group_extent: launch.group_extent.each_ref().map(expression),
+                    shared_bytes: expression(&launch.shared_bytes),
+                    ..launch.clone()
+                })
+                .collect(),
+            repeat: self.repeat.as_ref().map(|repeat| NativeRepeat {
+                count: expression(&repeat.count),
+                ..repeat.clone()
+            }),
+            ..self.clone()
+        }
+    }
+
+    /// The element reads of every expression of the implementation, each
+    /// once, in order.
+    fn element_reads(&self) -> Vec<(String, ElementQuery)> {
+        let reads = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        self.at_codes(&|element: &str, query: ElementQuery| {
+            reads.borrow_mut().insert((element.to_owned(), query));
+            0
+        });
+        reads.into_inner().into_iter().collect()
+    }
+
+    /// Whether the configurations of the implementation are those of every
+    /// formation of it: its `where` reads no element, as it does once
+    /// instantiated at its bindings ([`Self::at_elements`]). Otherwise which
+    /// configurations are admissible depends on the bindings, and
+    /// enumerating or validating them is `Unbound`.
+    fn enumerable(&self) -> Result<(), NativeSpecializationError> {
+        match self.constraint.as_ref().and_then(NativeCondition::element_read) {
+            None => Ok(()),
+            Some((element, query)) => Err(NativeSpecializationError::Unbound(query.spelled(element))),
+        }
+    }
+
+    /// The implementation with every element read replaced by
+    /// `code(W, query)`.
+    fn at_codes(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
+        self.mapped(
+            &|expression: &NativeNatExpr| expression.at_elements(&code),
+            &|condition: &NativeCondition| condition.at_elements(&code),
+        )
+    }
+
+    /// The launch ordinals of one call in dispatch order when its repeat
+    /// block runs `rounds` times.
+    pub fn dispatch_order(&self, rounds: u64) -> impl Iterator<Item = usize> + '_ {
+        let (first, end) = self.repeat.as_ref().map_or((0, 0), |repeat| {
+            (repeat.first, repeat.first + repeat.launches)
+        });
+        (0..first)
+            .chain((0..rounds).flat_map(move |_| first..end))
+            .chain(end..self.launches.len())
+    }
+}
+
+/// A native tensor port bound through a table of its records' device
+/// addresses: a tensor parameter by name, or a tensor result by its result
+/// ordinal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordPort {
+    Parameter(String),
+    Result(u32),
+}
+
+/// The dense element types a build-time compiled native form binds one
+/// element parameter to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeElementCoverage {
+    pub parameter: String,
+    pub dtypes: Vec<DType>,
+}
+
+impl NativeElementCoverage {
+    /// The coverage of an element parameter a CPU form stores when its
+    /// declaration lists none: the floating element types.
+    pub const DEFAULT: [DType; 3] = [DType::F32, DType::BF16, DType::F16];
+}
+
+/// A tuning parameter with its finite domain and its default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeParameter {
+    pub name: String,
+    /// Its value changes generated kernel code and must be fixed when that
+    /// launch's function is formed: the source reads it as a template
+    /// parameter. Derived from the source when the module is checked
+    /// ([`crate::native_source::derive_codes`]), never declared.
+    pub code: bool,
+    /// The parameter changes the arithmetic order of a row's result. Other
+    /// parameters must produce bit-identical results across their values.
+    pub arithmetic: bool,
+    /// Its values select structurally different algorithms (for example a
+    /// vector or a matrix form), whose best settings of the other parameters
+    /// are unrelated: tuning searches each form from a start of its own.
+    pub form: bool,
+    pub values: Vec<u64>,
+    pub default: NativeDefault,
+    pub role: NativeParameterRole,
+}
+
+/// How a parameter's default is chosen, over the static dimensions (the
+/// device's properties are substituted first, [`NativeImplementation::at_device`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeDefault {
+    /// `default EXPR`: its value, which must be one of the listed values.
+    Value(NativeNatExpr),
+    /// `default least where CONDITION`: the least listed value at which the
+    /// condition holds, the parameter reading as that value.
+    Least(NativeCondition),
+    /// `default greatest where CONDITION`: the greatest such value.
+    Greatest(NativeCondition),
+}
+
+impl NativeDefault {
+    /// The default of parameter `name` over `values` at the static
+    /// dimensions `dimension` supplies.
+    pub(crate) fn value(
+        &self,
+        name: &str,
+        values: &[u64],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<u64, NativeSpecializationError> {
+        self.chosen(name, values, dimension).map_err(|reason| NativeSpecializationError::Default {
+            parameter: name.to_owned(),
+            reason,
+        })
+    }
+
+    /// [`Self::value`], failing with the reason the default has no value.
+    fn chosen(
+        &self,
+        name: &str,
+        values: &[u64],
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<u64, String> {
+        match self {
+            Self::Value(expression) => {
+                let value =
+                    expression.evaluate(dimension, &|_| None).map_err(|error| error.to_string())?;
+                if values.contains(&value) {
+                    Ok(value)
+                } else {
+                    Err(format!("its value {value} is not a listed value"))
+                }
+            }
+            Self::Least(condition) | Self::Greatest(condition) => {
+                for value in self.order(values) {
+                    let parameter = |read: &str| (read == name).then_some(value);
+                    if condition.holds(dimension, &parameter).map_err(|error| error.to_string())? {
+                        return Ok(value);
+                    }
+                }
+                Err("no listed value satisfies its condition".to_owned())
+            }
+        }
+    }
+
+    /// The listed values in the order `least` or `greatest` tries them.
+    fn order(&self, values: &[u64]) -> Vec<u64> {
+        let mut order = values.to_vec();
+        order.sort_unstable();
+        if matches!(self, Self::Greatest(_)) {
+            order.reverse();
+        }
+        order
+    }
+
+    /// Check, as the module is checked, that a default reading no
+    /// dimension and no element has a value on every device of `backend`,
+    /// whose properties it may read: at both values of every `Support` it
+    /// reads, and at every whole number of every `Count`. With no `Count`
+    /// read it is evaluated at each assignment of its `Support`s, as a
+    /// device evaluates it. A `Count` has too many values to evaluate at
+    /// each, so a default reading one is bounded over all of them instead:
+    /// `default EXPR` holds when every value within its bounds is listed;
+    /// `least`/`greatest` when, in the order it tries them, some listed value
+    /// satisfies its condition on every device and each value before it
+    /// evaluates on every device. Both are sufficient, not necessary: a
+    /// refused default is stated so that its bounds show its value, such as
+    /// a `least where` with a listed value that always holds.
+    pub(crate) fn on_every_device(
+        &self,
+        name: &str,
+        values: &[u64],
+        backend: BackendName,
+    ) -> Result<(), NativeSpecializationError> {
+        use crate::device::{provided, PropertyKind};
+        let mut reads = Vec::new();
+        match self {
+            Self::Value(expression) => expression.device_reads(&mut reads),
+            Self::Least(condition) | Self::Greatest(condition) => condition.device_reads(&mut reads),
+        }
+        let (supports, counts): (Vec<String>, Vec<String>) = reads.into_iter().partition(|read| {
+            match provided(backend, read) {
+                Some(PropertyKind::Support) => true,
+                Some(PropertyKind::Count) => false,
+                other => unreachable!("the checker admits `device.{read}` of {backend:?} as {other:?}"),
+            }
+        });
+        // A `Count` stands as a dimension of its own name, ranging over
+        // every whole number: the default reads no other dimension.
+        let every = |read: &str| counts.iter().any(|count| count == read).then_some((0, u64::MAX));
+        let parameter = |value: u64| move |read: &str| (read == name).then_some((value, value));
+        for assignment in 0u64..1 << supports.len() {
+            let support = |read: &str| {
+                supports.iter().position(|support| support == read).map(|bit| assignment >> bit & 1)
+            };
+            let read = |read: &str| {
+                support(read).map_or_else(|| NativeNatExpr::Dimension(read.to_owned()), NativeNatExpr::Constant)
+            };
+            let default = self.mapped(&|expression| expression.with_device(&read), &|condition| {
+                condition.with_device(&read)
+            });
+            let failed = |reason: String| NativeSpecializationError::Default {
+                parameter: name.to_owned(),
+                reason: if supports.is_empty() {
+                    reason
+                } else {
+                    let device = supports
+                        .iter()
+                        .map(|read| format!("device.{read} = {}", support(read).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("on a device where {device}: {reason}")
+                },
+            };
+            if counts.is_empty() {
+                default.chosen(name, values, &|_| None).map_err(failed)?;
+                continue;
+            }
+            match &default {
+                Self::Value(expression) => {
+                    let (low, high) = expression
+                        .bounds(&every, &|_| None)
+                        .ok_or_else(|| failed("it may fail to evaluate on some device".to_owned()))?;
+                    if let Some(unlisted) = (low..=high).find(|value| !values.contains(value)) {
+                        return Err(failed(format!(
+                            "on some device it may be {unlisted}, which is not a listed value"
+                        )));
+                    }
+                }
+                Self::Least(condition) | Self::Greatest(condition) => {
+                    let mut satisfied = false;
+                    for value in self.order(values) {
+                        match condition.bounded(&every, &parameter(value)) {
+                            NativeBounded::Always(true) => {
+                                satisfied = true;
+                                break;
+                            }
+                            NativeBounded::Fallible => {
+                                return Err(failed(format!(
+                                    "its condition may fail to evaluate on some device at {value}"
+                                )));
+                            }
+                            NativeBounded::Always(false) | NativeBounded::Infallible => {}
+                        }
+                    }
+                    if !satisfied {
+                        return Err(failed(
+                            "no listed value satisfies its condition on every device".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The default with its expression or condition replaced by its image.
+    fn mapped(
+        &self,
+        expression: &impl Fn(&NativeNatExpr) -> NativeNatExpr,
+        condition: &impl Fn(&NativeCondition) -> NativeCondition,
+    ) -> Self {
+        match self {
+            Self::Value(value) => Self::Value(expression(value)),
+            Self::Least(least) => Self::Least(condition(least)),
+            Self::Greatest(greatest) => Self::Greatest(condition(greatest)),
+        }
+    }
+}
+
+/// What a native tuning parameter chooses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeParameterRole {
+    /// Declared in the `params` clause; the implementation's source and
+    /// launch geometry read it.
+    Declared,
+    /// Seismic-owned, on CPU devices: how many pool participants claim the
+    /// work items of launch `launch`. `0` is every participant.
+    Workers { launch: u32 },
+    /// Seismic-owned, on CPU devices: the instruction-set tier the
+    /// implementation runs at. `0` is the device's detected tier; `t` is the
+    /// tier of [`NativeParameterRole::TIERS`] ordinal `t - 1`.
+    Tier,
+}
+
+impl NativeParameterRole {
+    /// The tiers a `Tier` parameter value names, by ordinal from 1.
+    pub const TIERS: [&'static str; 6] =
+        ["x86v2", "x86v3", "x86v4", "x86v4vnni", "neon", "neondot"];
+}
+
+impl NativeParameter {
+    /// The Seismic-owned parameters a CPU device adds to an implementation
+    /// with `launches` launches: one participant count per launch (every
+    /// participant, then each power of two below `participants`), then the
+    /// tier (the detected one, then each tier in `lower`, by
+    /// [`NativeParameterRole::TIERS`] name). Their names contain `.`, which no
+    /// declared parameter name can.
+    pub fn cpu_parameters(
+        launches: usize,
+        participants: usize,
+        lower: &[&str],
+    ) -> Vec<NativeParameter> {
+        let counts = std::iter::once(0)
+            .chain(
+                (0..)
+                    .map(|power| 1u64 << power)
+                    .take_while(|count| *count < participants as u64),
+            )
+            .collect::<Vec<_>>();
+        let tiers = std::iter::once(0)
+            .chain(lower.iter().map(|tier| {
+                NativeParameterRole::TIERS
+                    .iter()
+                    .position(|known| known == tier)
+                    .expect("a CPU tier is one of NativeParameterRole::TIERS")
+                    as u64
+                    + 1
+            }))
+            .collect();
+        (0..launches)
+            .map(|launch| NativeParameter {
+                name: format!("cpu.workers.{launch}"),
+                code: false,
+                arithmetic: false,
+                form: false,
+                values: counts.clone(),
+                default: NativeDefault::Value(NativeNatExpr::Constant(0)),
+                role: NativeParameterRole::Workers {
+                    launch: launch as u32,
+                },
+            })
+            .chain(std::iter::once(NativeParameter {
+                name: "cpu.tier".to_owned(),
+                code: false,
+                arithmetic: false,
+                form: false,
+                values: tiers,
+                default: NativeDefault::Value(NativeNatExpr::Constant(0)),
+                role: NativeParameterRole::Tier,
+            }))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeComparison {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// A boolean formula over native natural-number expressions: a native
+/// `where` or `when` condition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeCondition {
+    Compare {
+        comparison: NativeComparison,
+        left: NativeNatExpr,
+        right: NativeNatExpr,
+    },
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+}
+
+/// Call-private device memory of one native call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeScratch {
+    pub name: String,
+    pub bytes: NativeNatExpr,
+    /// Arrival counters, placed apart from every other buffer: zero when a
+    /// launch starts, restored to zero by the call's kernels before it ends
+    /// (so one zeroed region serves every call and graph that uses it). One
+    /// word is the exception: a resident launch's barrier's give-up word
+    /// (`registry::RESIDENT_GIVE_UP_BYTE`) stays set once a wait gave up,
+    /// and the device is lost to its load.
+    pub sync: bool,
+    /// The buffer is sized by `bytes` only when this holds; otherwise it
+    /// keeps its ABI slot at the minimum charge and `bytes` is not
+    /// evaluated. `None` is always active.
+    pub when: Option<NativeCondition>,
+}
+
+/// One ordered dispatch of a native call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeLaunch {
+    /// Kernel function name in the native source.
+    pub kernel: String,
+    /// Parameters scoped to this launch. Another launch may reuse a name.
+    pub params: Vec<NativeParameter>,
+    /// Entry parameters used by this kernel beyond its launch expressions.
+    pub reads: Vec<String>,
+    /// The launch runs only when this holds; an inactive launch is not
+    /// encoded, not limit-checked, and its geometry is not evaluated. It
+    /// keeps its ordinal. `None` is always active.
+    pub when: Option<NativeCondition>,
+    /// Number of groups on each axis; with `grid`, the most the grid holds.
+    pub groups: [NativeNatExpr; 3],
+    /// The three `i32` group counts the launch dispatches, written by an
+    /// earlier launch and read when this one runs. It is a read like any
+    /// other, so the launch is ordered after its writer. Nothing gates a
+    /// written grid's launch on its words: an empty grid runs nothing by
+    /// itself where it is dispatched indirectly (Metal, Vulkan) or read as
+    /// the launch runs (the CPU), and on CUDA, which loops over it with the
+    /// device's resident blocks, costs about what any launch does, which a
+    /// conditional graph node would cost more than on every replay (on an
+    /// RTX 3090, an empty grid 0.7 us at one block and 1.3 us at 656 blocks
+    /// of 256 threads, a conditional node holding its launch
+    /// 7.4 us, and 112 KiB more of an instantiated graph).
+    pub grid: Option<LaunchGrid>,
+    /// The launch conditions it is encoded under (`if (w)`, `unless (w)`),
+    /// a conjunction of distinct host-written words: encoded while every
+    /// one holds.
+    pub conditions: Vec<LaunchCondition>,
+    /// Participants of one group on each axis.
+    pub group_extent: [NativeNatExpr; 3],
+    /// Dynamic group-shared memory in bytes.
+    pub shared_bytes: NativeNatExpr,
+    /// A resident launch's barrier: its grid is `RESIDENT` (the backend's
+    /// co-resident threadgroups for the formed pipeline, at most `groups`'
+    /// first axis), never an expression; `None` dispatches `groups`.
+    pub resident: Option<ResidentLaunch>,
+}
+
+/// A resident launch (`launch K resident (BARRIER)`): every threadgroup of
+/// its one-axis grid is co-resident (`BackendName::resident_launches`), so they meet
+/// at grid barriers, held at the start of the `sync` scratch buffer
+/// `barrier` (`registry::RESIDENT_BARRIER_BYTES`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentLaunch {
+    pub barrier: String,
+}
+
+/// Where a launch's written grid lives.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchGrid {
+    /// An entry tensor parameter (`&tensor[3] i32`): an earlier call wrote
+    /// it.
+    Parameter(String),
+    /// A 12-byte scratch buffer of the implementation: an earlier launch of
+    /// the same call wrote it.
+    Scratch(String),
+}
+
+/// A launch's condition: word `index` of an entry tensor parameter
+/// `word` (`&tensor[N] i32`, `index` < N, checked as the program forms),
+/// written by the host between submissions and read when the run is
+/// encoded; under the other value the launch is not encoded at all, so it
+/// costs nothing, not even a dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchCondition {
+    pub word: String,
+    pub index: u64,
+    pub encoded: Encoded,
+}
+
+/// The value of a launch condition's word the launch is encoded under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Encoded {
+    /// `if (w)`: while the word is nonzero.
+    WhileSet,
+    /// `unless (w)`: while the word is zero.
+    WhileClear,
+}
+
+impl Encoded {
+    /// Its clause's keyword.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Encoded::WhileSet => "if",
+            Encoded::WhileClear => "unless",
+        }
+    }
+
+    /// Whether a launch under this condition is encoded while its word is
+    /// `word`.
+    pub fn encodes(self, word: u32) -> bool {
+        (word != 0) == (self == Encoded::WhileSet)
+    }
+}
+
+/// Closed integer language used by native declarations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeNatExpr {
+    Constant(u64),
+    Dimension(String),
+    Parameter(String),
+    /// `query` of the representation element parameter `W` is bound to
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`). It has a value only in an
+    /// implementation instantiated at its bindings
+    /// ([`NativeImplementation::at_elements`]).
+    Element(String, ElementQuery),
+    /// `device.NAME`: a property the implementation's backend provides
+    /// ([`crate::device::provided`]). It has a value only in an
+    /// implementation instantiated on a device
+    /// ([`NativeImplementation::at_device`]).
+    Device(String),
+    Add(Box<Self>, Box<Self>),
+    Sub(Box<Self>, Box<Self>),
+    Mul(Box<Self>, Box<Self>),
+    Div(Box<Self>, Box<Self>),
+    Rem(Box<Self>, Box<Self>),
+    CeilDiv(Box<Self>, Box<Self>),
+    Min(Box<Self>, Box<Self>),
+    Max(Box<Self>, Box<Self>),
+}
+
+/// What a native expression reads of the representation an element
+/// parameter is bound to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ElementQuery {
+    /// `operands(W)`: the operand recipe code
+    /// ([`crate::registry::OperandRecipe::code`]).
+    Operands,
+    /// `form(W, NAME)`: the admitted value of the implementation backend's
+    /// form NAME ([`crate::forms::Form::of`]).
+    Form(crate::forms::Form),
+    /// `unit_columns(W)`: the columns of a unit of the code planes' words of
+    /// a conversion into packed `W`, which a converter places together
+    /// ([`crate::repack::conversion_unit_columns`]). The checker admits it
+    /// only over an entry's conversion destination (`repack[U = W]`). It has
+    /// a value only where `W` is bound to a packed destination: a dense
+    /// destination (the element cast `repack` forms between dense floats)
+    /// has none, and an implementation reading it does not form there.
+    UnitColumns,
+    /// `packed(W)`: 1 where `W` is a packed representation (a packet or row
+    /// layout), else 0 (dense or external).
+    Packed,
+}
+
+impl ElementQuery {
+    /// The query's value for `representation`; `unit_columns` has none for
+    /// a representation no conversion packs into.
+    pub fn of(self, representation: RepresentationId) -> Option<u64> {
+        let info = registry::representation_info(representation);
+        match self {
+            Self::Operands => Some(info.operands.code()),
+            Self::Form(form) => Some(u64::from(form.of(representation))),
+            Self::UnitColumns => registry::ConversionLayout::of(&info.kind)
+                .map(|layout| u64::from(crate::repack::conversion_unit_columns(layout))),
+            Self::Packed => Some(u64::from(matches!(
+                info.kind,
+                registry::RepresentationKind::Packed(_) | registry::RepresentationKind::PackedRows(_)
+            ))),
+        }
+    }
+
+    /// Every value the query takes over the registry's representations, in
+    /// increasing order.
+    fn values(self) -> Vec<u64> {
+        match self {
+            Self::Operands => registry::OperandRecipe::ALL.map(registry::OperandRecipe::code).to_vec(),
+            Self::Form(form) => form.values().into_iter().map(u64::from).collect(),
+            Self::UnitColumns => {
+                let mut columns: Vec<u64> = registry::representation_conversions()
+                    .iter()
+                    .map(|conversion| {
+                        u64::from(crate::repack::conversion_unit_columns(
+                            conversion.destination_layout,
+                        ))
+                    })
+                    .collect();
+                columns.sort_unstable();
+                columns.dedup();
+                columns
+            }
+            Self::Packed => vec![0, 1],
+        }
+    }
+
+    /// The query as a declaration spells it over element parameter `element`.
+    fn spelled(self, element: &str) -> String {
+        match self {
+            Self::Operands => format!("operands({element})"),
+            Self::Form(form) => format!("form({element}, {})", form.name()),
+            Self::UnitColumns => format!("unit_columns({element})"),
+            Self::Packed => format!("packed({element})"),
+        }
+    }
+}
+
+/// What a native condition is over ranges of the names it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeBounded {
+    /// It evaluates to this value at every assignment within the ranges.
+    Always(bool),
+    /// It evaluates, to either value, at every assignment within the ranges.
+    Infallible,
+    /// It may fail to evaluate at some assignment within the ranges.
+    Fallible,
+}
+
+/// A native expression could not be evaluated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeEvalError {
+    /// A name has no value in the evaluation environment.
+    Unbound(String),
+    /// Overflow, underflow, or division by zero.
+    Arithmetic,
+}
+
+impl std::fmt::Display for NativeEvalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbound(name) => write!(f, "native expression name `{name}` has no value"),
+            Self::Arithmetic => {
+                f.write_str("native expression overflowed, underflowed, or divided by zero")
+            }
+        }
+    }
+}
+
+impl NativeNatExpr {
+    /// The expression with every element read replaced by `code(W, query)`.
+    fn at_elements(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
+        let binary = |left: &Self, right: &Self, make: fn(Box<Self>, Box<Self>) -> Self| {
+            make(Box::new(left.at_elements(code)), Box::new(right.at_elements(code)))
+        };
+        match self {
+            Self::Element(element, query) => Self::Constant(code(element, *query)),
+            Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) | Self::Device(_) => {
+                self.clone()
+            }
+            Self::Add(left, right) => binary(left, right, Self::Add),
+            Self::Sub(left, right) => binary(left, right, Self::Sub),
+            Self::Mul(left, right) => binary(left, right, Self::Mul),
+            Self::Div(left, right) => binary(left, right, Self::Div),
+            Self::Rem(left, right) => binary(left, right, Self::Rem),
+            Self::CeilDiv(left, right) => binary(left, right, Self::CeilDiv),
+            Self::Min(left, right) => binary(left, right, Self::Min),
+            Self::Max(left, right) => binary(left, right, Self::Max),
+        }
+    }
+
+    /// Evaluate with `dimension` and `parameter` supplying named values.
+    pub fn evaluate(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<u64, NativeEvalError> {
+        let binary = |left: &Self, right: &Self, operation: fn(u64, u64) -> Option<u64>| {
+            let left = left.evaluate(dimension, parameter)?;
+            let right = right.evaluate(dimension, parameter)?;
+            operation(left, right).ok_or(NativeEvalError::Arithmetic)
+        };
+        match self {
+            Self::Constant(value) => Ok(*value),
+            Self::Dimension(name) => {
+                dimension(name).ok_or_else(|| NativeEvalError::Unbound(name.clone()))
+            }
+            Self::Parameter(name) => {
+                parameter(name).ok_or_else(|| NativeEvalError::Unbound(name.clone()))
+            }
+            Self::Element(element, query) => Err(NativeEvalError::Unbound(query.spelled(element))),
+            Self::Device(name) => Err(NativeEvalError::Unbound(format!("device.{name}"))),
+            Self::Add(left, right) => binary(left, right, u64::checked_add),
+            Self::Sub(left, right) => binary(left, right, u64::checked_sub),
+            Self::Mul(left, right) => binary(left, right, u64::checked_mul),
+            Self::Div(left, right) => binary(left, right, u64::checked_div),
+            Self::Rem(left, right) => binary(left, right, u64::checked_rem),
+            Self::CeilDiv(left, right) => binary(left, right, |left, right| {
+                if right == 0 {
+                    None
+                } else {
+                    Some(left.div_ceil(right))
+                }
+            }),
+            Self::Min(left, right) => binary(left, right, |left, right| Some(left.min(right))),
+            Self::Max(left, right) => binary(left, right, |left, right| Some(left.max(right))),
+        }
+    }
+
+    /// The least and greatest value the expression takes when every name
+    /// ranges over the inclusive bounds `dimension` and `parameter` supply,
+    /// or `None` when it may fail to evaluate at some value within them (a
+    /// name without bounds, overflow, underflow or division by zero).
+    pub fn bounds(
+        &self,
+        dimension: &impl Fn(&str) -> Option<(u64, u64)>,
+        parameter: &impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        let operands = |left: &Self, right: &Self| {
+            Some((
+                left.bounds(dimension, parameter)?,
+                right.bounds(dimension, parameter)?,
+            ))
+        };
+        match self {
+            Self::Constant(value) => Some((*value, *value)),
+            Self::Dimension(name) => dimension(name),
+            Self::Parameter(name) => parameter(name),
+            Self::Element(..) | Self::Device(_) => None,
+            Self::Add(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                Some((a + c, b.checked_add(d)?))
+            }
+            Self::Sub(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                Some((a.checked_sub(d)?, b - c))
+            }
+            Self::Mul(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                Some((a * c, b.checked_mul(d)?))
+            }
+            Self::Div(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                (c > 0).then(|| (a / d, b / c))
+            }
+            Self::Rem(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                (c > 0).then(|| if b < c { (a, b) } else { (0, b.min(d - 1)) })
+            }
+            Self::CeilDiv(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                (c > 0).then(|| (a.div_ceil(d), b.div_ceil(c)))
+            }
+            Self::Min(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                Some((a.min(c), b.min(d)))
+            }
+            Self::Max(left, right) => {
+                let ((a, b), (c, d)) = operands(left, right)?;
+                Some((a.max(c), b.max(d)))
+            }
+        }
+    }
+
+    /// Every dimension name the expression reads.
+    pub fn dimensions(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Constant(_) | Self::Parameter(_) | Self::Element(..) | Self::Device(_) => {}
+            Self::Dimension(name) => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.dimensions(out);
+                right.dimensions(out);
+            }
+        }
+    }
+
+    /// Every tuning parameter name the expression reads.
+    pub fn parameters(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Constant(_) | Self::Dimension(_) | Self::Element(..) | Self::Device(_) => {}
+            Self::Parameter(name) => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.parameters(out);
+                right.parameters(out);
+            }
+        }
+    }
+
+    /// The first element read of the expression, if it makes one.
+    pub(crate) fn element_read(&self) -> Option<(&str, ElementQuery)> {
+        match self {
+            Self::Element(element, query) => Some((element, *query)),
+            Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) | Self::Device(_) => None,
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => left.element_read().or_else(|| right.element_read()),
+        }
+    }
+
+    /// Every integer literal the expression contains.
+    pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
+        match self {
+            Self::Constant(value) => {
+                out.insert(*value);
+            }
+            Self::Dimension(_) | Self::Parameter(_) | Self::Element(..) | Self::Device(_) => {}
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.constants(out);
+                right.constants(out);
+            }
+        }
+    }
+}
+
+impl NativeCondition {
+    /// The condition with every element read replaced by `code(W, query)`.
+    fn at_elements(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => Self::Compare {
+                comparison: *comparison,
+                left: left.at_elements(code),
+                right: right.at_elements(code),
+            },
+            Self::And(left, right) => Self::And(
+                Box::new(left.at_elements(code)),
+                Box::new(right.at_elements(code)),
+            ),
+            Self::Or(left, right) => Self::Or(
+                Box::new(left.at_elements(code)),
+                Box::new(right.at_elements(code)),
+            ),
+        }
+    }
+
+    /// The first element read of the condition, if it makes one.
+    pub(crate) fn element_read(&self) -> Option<(&str, ElementQuery)> {
+        match self {
+            Self::Compare { left, right, .. } => left.element_read().or_else(|| right.element_read()),
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.element_read().or_else(|| right.element_read())
+            }
+        }
+    }
+
+    /// The top-level `and` operands, in order.
+    pub fn conjuncts<'c>(&'c self, out: &mut Vec<&'c Self>) {
+        match self {
+            Self::And(left, right) => {
+                left.conjuncts(out);
+                right.conjuncts(out);
+            }
+            Self::Compare { .. } | Self::Or(..) => out.push(self),
+        }
+    }
+
+    /// Every integer literal the condition contains.
+    pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.constants(out);
+                right.constants(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.constants(out);
+                right.constants(out);
+            }
+        }
+    }
+
+    /// Evaluate with `dimension` and `parameter` supplying named values.
+    /// `and` and `or` evaluate their right side only when the left side
+    /// does not decide the result.
+    pub fn holds(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<bool, NativeEvalError> {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => {
+                let left = left.evaluate(dimension, parameter)?;
+                let right = right.evaluate(dimension, parameter)?;
+                Ok(match comparison {
+                    NativeComparison::Lt => left < right,
+                    NativeComparison::Le => left <= right,
+                    NativeComparison::Gt => left > right,
+                    NativeComparison::Ge => left >= right,
+                    NativeComparison::Eq => left == right,
+                    NativeComparison::Ne => left != right,
+                })
+            }
+            Self::And(left, right) => {
+                Ok(left.holds(dimension, parameter)? && right.holds(dimension, parameter)?)
+            }
+            Self::Or(left, right) => {
+                Ok(left.holds(dimension, parameter)? || right.holds(dimension, parameter)?)
+            }
+        }
+    }
+
+    /// The condition's value when `dimension` and `parameter` supply only
+    /// some of the names it reads, or `None` while they do not decide it.
+    /// Unlike [`Self::holds`], an operand that cannot be evaluated does not
+    /// hide one that decides the result: `and` is false with either operand
+    /// false, `or` true with either true.
+    pub fn decided(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Option<bool> {
+        match self {
+            Self::Compare { .. } => self.holds(dimension, parameter).ok(),
+            Self::And(left, right) => {
+                match (left.decided(dimension, parameter), right.decided(dimension, parameter)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            Self::Or(left, right) => {
+                match (left.decided(dimension, parameter), right.decided(dimension, parameter)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Whether the condition can hold at some values of the names within the
+    /// inclusive bounds `dimension` and `parameter` supply. Unlike
+    /// [`Self::bounded`], an operand that cannot be bounded does not hide one
+    /// that is false throughout: `and` cannot hold with either operand false
+    /// throughout, `or` only with both.
+    pub fn may_hold(
+        &self,
+        dimension: &impl Fn(&str) -> Option<(u64, u64)>,
+        parameter: &impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> bool {
+        match self {
+            Self::Compare { .. } => self.bounded(dimension, parameter) != NativeBounded::Always(false),
+            Self::And(left, right) => left.may_hold(dimension, parameter) && right.may_hold(dimension, parameter),
+            Self::Or(left, right) => left.may_hold(dimension, parameter) || right.may_hold(dimension, parameter),
+        }
+    }
+
+    /// What the condition is when every name ranges over the inclusive
+    /// bounds `dimension` and `parameter` supply, evaluated as
+    /// [`Self::holds`] evaluates it: `and` and `or` read their right side
+    /// only when the left does not decide.
+    pub fn bounded(
+        &self,
+        dimension: &impl Fn(&str) -> Option<(u64, u64)>,
+        parameter: &impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> NativeBounded {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => {
+                let (Some((a, b)), Some((c, d))) = (
+                    left.bounds(dimension, parameter),
+                    right.bounds(dimension, parameter),
+                ) else {
+                    return NativeBounded::Fallible;
+                };
+                let decided = match comparison {
+                    NativeComparison::Lt => (b < c).then_some(true).or((a >= d).then_some(false)),
+                    NativeComparison::Le => (b <= c).then_some(true).or((a > d).then_some(false)),
+                    NativeComparison::Gt => (a > d).then_some(true).or((b <= c).then_some(false)),
+                    NativeComparison::Ge => (a >= d).then_some(true).or((b < c).then_some(false)),
+                    NativeComparison::Eq => (a == b && b == c && c == d)
+                        .then_some(true)
+                        .or((b < c || d < a).then_some(false)),
+                    NativeComparison::Ne => (b < c || d < a)
+                        .then_some(true)
+                        .or((a == b && b == c && c == d).then_some(false)),
+                };
+                decided.map_or(NativeBounded::Infallible, NativeBounded::Always)
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                // The value at which the left side decides the result.
+                let deciding = matches!(self, Self::Or(..));
+                match left.bounded(dimension, parameter) {
+                    NativeBounded::Always(value) if value == deciding => {
+                        NativeBounded::Always(deciding)
+                    }
+                    NativeBounded::Always(_) => right.bounded(dimension, parameter),
+                    NativeBounded::Infallible => match right.bounded(dimension, parameter) {
+                        NativeBounded::Always(value) if value == deciding => {
+                            NativeBounded::Always(deciding)
+                        }
+                        NativeBounded::Always(_) | NativeBounded::Infallible => {
+                            NativeBounded::Infallible
+                        }
+                        NativeBounded::Fallible => NativeBounded::Fallible,
+                    },
+                    NativeBounded::Fallible => NativeBounded::Fallible,
+                }
+            }
+        }
+    }
+
+    /// Every dimension name the condition reads.
+    pub fn dimensions(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.dimensions(out);
+                right.dimensions(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.dimensions(out);
+                right.dimensions(out);
+            }
+        }
+    }
+
+    /// Every tuning parameter name the condition reads.
+    pub fn parameters(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.parameters(out);
+                right.parameters(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.parameters(out);
+                right.parameters(out);
+            }
+        }
+    }
+}
+
+impl NativeNatExpr {
+    /// The expression with every device read `device.NAME` replaced by
+    /// `read(NAME)`.
+    fn with_device(&self, read: &impl Fn(&str) -> Self) -> Self {
+        let binary = |left: &Self, right: &Self, make: fn(Box<Self>, Box<Self>) -> Self| {
+            make(Box::new(left.with_device(read)), Box::new(right.with_device(read)))
+        };
+        match self {
+            Self::Device(name) => read(name),
+            Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) | Self::Element(..) => {
+                self.clone()
+            }
+            Self::Add(left, right) => binary(left, right, Self::Add),
+            Self::Sub(left, right) => binary(left, right, Self::Sub),
+            Self::Mul(left, right) => binary(left, right, Self::Mul),
+            Self::Div(left, right) => binary(left, right, Self::Div),
+            Self::Rem(left, right) => binary(left, right, Self::Rem),
+            Self::CeilDiv(left, right) => binary(left, right, Self::CeilDiv),
+            Self::Min(left, right) => binary(left, right, Self::Min),
+            Self::Max(left, right) => binary(left, right, Self::Max),
+        }
+    }
+
+    /// Every device property the expression reads.
+    pub fn device_reads(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Device(name) => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) | Self::Element(..) => {}
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => {
+                left.device_reads(out);
+                right.device_reads(out);
+            }
+        }
+    }
+}
+
+impl NativeCondition {
+    /// The condition with every device read `device.NAME` replaced by
+    /// `read(NAME)`.
+    fn with_device(&self, read: &impl Fn(&str) -> NativeNatExpr) -> Self {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => Self::Compare {
+                comparison: *comparison,
+                left: left.with_device(read),
+                right: right.with_device(read),
+            },
+            Self::And(left, right) => {
+                Self::And(Box::new(left.with_device(read)), Box::new(right.with_device(read)))
+            }
+            Self::Or(left, right) => {
+                Self::Or(Box::new(left.with_device(read)), Box::new(right.with_device(read)))
+            }
+        }
+    }
+
+    /// Every device property the condition reads.
+    pub fn device_reads(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Compare { left, right, .. } => {
+                left.device_reads(out);
+                right.device_reads(out);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.device_reads(out);
+                right.device_reads(out);
+            }
+        }
+    }
+}
+
+impl NativeScratch {
+    /// This buffer's charge in one configuration: its bytes at the
+    /// dimension and parameter values, or the minimum charge of one byte
+    /// (its ABI slot) when its guard does not hold.
+    pub fn charge(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<u64, NativeEvalError> {
+        if let Some(condition) = &self.when {
+            if !condition.holds(dimension, parameter)? {
+                return Ok(1);
+            }
+        }
+        self.bytes.evaluate(dimension, parameter).map(|bytes| bytes.max(1))
+    }
+
+    /// Every dimension name the charge or its guard reads.
+    pub fn dimensions(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        self.bytes.dimensions(&mut names);
+        if let Some(condition) = &self.when {
+            condition.dimensions(&mut names);
+        }
+        names
+    }
+
+    /// Every tuning parameter the charge or its guard reads into `out`:
+    /// entry-wide ones alone, as a launch's parameters stay in its scope.
+    pub fn parameters(&self, out: &mut Vec<String>) {
+        self.bytes.parameters(out);
+        if let Some(condition) = &self.when {
+            condition.parameters(out);
+        }
+    }
+}
+
+impl NativeImplementation {
+    /// Whether preparation must choose any declared tuning parameter, either
+    /// for the entry as a whole or for an individual launch.
+    pub fn has_tuning_parameters(&self) -> bool {
+        !self.params.is_empty() || self.launches.iter().any(|launch| !launch.params.is_empty())
+    }
+
+    /// `specialization` with every Seismic-owned parameter it leaves unset at
+    /// its default. Callers choose declared parameters; Seismic-owned ones
+    /// are chosen by tuning or default.
+    pub fn with_owned_defaults(
+        &self,
+        specialization: NativeSpecialization,
+    ) -> NativeSpecialization {
+        self.params
+            .iter()
+            .filter(|parameter| parameter.role != NativeParameterRole::Declared)
+            .fold(specialization, |specialization, parameter| {
+                if specialization.param(&parameter.name).is_some() {
+                    specialization
+                } else {
+                    let default = parameter
+                        .default
+                        .value(&parameter.name, &parameter.values, &|_| None)
+                        .expect("a Seismic-owned parameter's default is a listed constant");
+                    specialization.with_param(parameter.name.clone(), default)
+                }
+            })
+    }
+
+    /// `specialization` as preparation takes it: its unset Seismic-owned
+    /// parameters at their defaults ([`Self::with_owned_defaults`]),
+    /// checked against the declaration ([`Self::validate`]).
+    pub fn prepared(
+        &self,
+        specialization: NativeSpecialization,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        let specialization = self.with_owned_defaults(specialization);
+        self.validate(&specialization)?;
+        Ok(specialization)
+    }
+
+    /// The parameters of the `params` clause, in declaration order.
+    pub fn declared_params(&self) -> impl Iterator<Item = &NativeParameter> {
+        self.params
+            .iter()
+            .filter(|parameter| parameter.role == NativeParameterRole::Declared)
+    }
+
+    /// Every tuning parameter launch `launch` reads: those its declaration
+    /// reads, and its Seismic-owned participant count.
+    pub fn launch_parameters(&self, launch: usize) -> Vec<String> {
+        let mut out = self.launches[launch].parameters();
+        for parameter in &self.launches[launch].params {
+            if !out.contains(&parameter.name) {
+                out.push(parameter.name.clone());
+            }
+        }
+        out.extend(
+            self.params
+                .iter()
+                .filter(|parameter| {
+                    parameter.role
+                        == NativeParameterRole::Workers {
+                            launch: launch as u32,
+                        }
+                })
+                .map(|parameter| parameter.name.clone()),
+        );
+        out
+    }
+
+    /// The code parameters of launch `launch`'s template header, in
+    /// declaration order, each with whether it is launch-local: the entry's
+    /// code parameters the launch reads (each, where no launch reads it),
+    /// then the launch's own.
+    pub fn code_parameters(&self, launch: usize) -> Vec<(bool, &str)> {
+        let reads = self.launches[launch].parameters();
+        self.params
+            .iter()
+            .filter(|parameter| {
+                parameter.code
+                    && (reads.contains(&parameter.name)
+                        || !self
+                            .launches
+                            .iter()
+                            .any(|candidate| candidate.parameters().contains(&parameter.name)))
+            })
+            .map(|parameter| (false, parameter.name.as_str()))
+            .chain(
+                self.launches[launch]
+                    .params
+                    .iter()
+                    .filter(|parameter| parameter.code)
+                    .map(|parameter| (true, parameter.name.as_str())),
+            )
+            .collect()
+    }
+
+    /// A launch-local choice or an explicit kernel read needs per-launch
+    /// source formation rather than entry-wide tuning macros, and so does a
+    /// written grid authored as a block: its launch's whole source sees the
+    /// grid's blocks (the runtime's `abi::WRITTEN_GRID_BLOCK`), and so does
+    /// a launch's own record ports: its source reads them as tables, and
+    /// every other port as its view.
+    pub fn launch_scoped(&self) -> bool {
+        !self.launch_records.is_empty()
+            || self.launches.iter().any(|launch| {
+                !launch.params.is_empty()
+                    || !launch.reads.is_empty()
+                    || (self.backend.authors_written_grid_blocks() && launch.grid.is_some())
+            })
+    }
+
+    /// The record ports of launch `launch`: its own, else the native's.
+    pub fn launch_records(&self, launch: usize) -> &[RecordPort] {
+        self.launch_records
+            .iter()
+            .find(|(ordinal, _)| *ordinal == launch)
+            .map_or(&self.records, |(_, records)| records)
+    }
+}
+
+impl NativeLaunch {
+    /// Every tuning parameter the launch's declaration reads: its `when`
+    /// condition, groups, group extent and shared bytes.
+    pub fn parameters(&self) -> Vec<String> {
+        let mut out = self.reads.clone();
+        if let Some(when) = &self.when {
+            when.parameters(&mut out);
+        }
+        for expression in self.groups.iter().chain(&self.group_extent) {
+            expression.parameters(&mut out);
+        }
+        self.shared_bytes.parameters(&mut out);
+        out
+    }
+}
+
+/// One value for every static dimension and tuning parameter of a native
+/// implementation, and the range of any call-time dimension its calls are
+/// held to. It is the complete compile-time input of native formation beyond
+/// element bindings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NativeSpecialization {
+    statics: std::collections::BTreeMap<String, u64>,
+    params: std::collections::BTreeMap<String, u64>,
+    launch_params: std::collections::BTreeMap<(usize, String), u64>,
+    ranges: std::collections::BTreeMap<String, (u64, u64)>,
+}
+
+impl NativeSpecialization {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Fix a static dimension.
+    pub fn with_static(mut self, name: impl Into<String>, value: u64) -> Self {
+        self.statics.insert(name.into(), value);
+        self
+    }
+    /// Choose a tuning parameter value.
+    pub fn with_param(mut self, name: impl Into<String>, value: u64) -> Self {
+        self.params.insert(name.into(), value);
+        self
+    }
+    /// Choose a parameter in one launch's lexical scope.
+    pub fn with_launch_param(mut self, launch: usize, name: impl Into<String>, value: u64) -> Self {
+        self.launch_params.insert((launch, name.into()), value);
+        self
+    }
+    /// Hold every call to call-time dimension `name` in `low..=high`: a
+    /// launch no value in the range activates is not formed, and a call
+    /// outside it is refused.
+    pub fn with_range(mut self, name: impl Into<String>, low: u64, high: u64) -> Self {
+        self.ranges.insert(name.into(), (low, high));
+        self
+    }
+    pub fn ranges(&self) -> &std::collections::BTreeMap<String, (u64, u64)> {
+        &self.ranges
+    }
+    pub fn statics(&self) -> &std::collections::BTreeMap<String, u64> {
+        &self.statics
+    }
+    pub fn params(&self) -> &std::collections::BTreeMap<String, u64> {
+        &self.params
+    }
+    pub fn launch_params(&self) -> &std::collections::BTreeMap<(usize, String), u64> {
+        &self.launch_params
+    }
+    pub fn static_value(&self, name: &str) -> Option<u64> {
+        self.statics.get(name).copied()
+    }
+    pub fn param(&self, name: &str) -> Option<u64> {
+        self.params.get(name).copied()
+    }
+    pub fn launch_param(&self, launch: usize, name: &str) -> Option<u64> {
+        // A launch declares few parameters; scanning its range allocates no key.
+        self.launch_params
+            .range((launch, String::new())..(launch + 1, String::new()))
+            .find(|((_, key), _)| key == name)
+            .map(|(_, value)| *value)
+    }
+}
+
+/// A specialization does not match its native implementation's declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeSpecializationError {
+    MissingStatic(String),
+    UnknownStatic(String),
+    MissingParameter(String),
+    UnknownParameter(String),
+    OutsideDomain {
+        parameter: String,
+        value: u64,
+    },
+    MissingLaunchParameter {
+        launch: usize,
+        name: String,
+    },
+    UnknownLaunchParameter {
+        launch: usize,
+        name: String,
+    },
+    OutsideLaunchDomain {
+        launch: usize,
+        name: String,
+        value: u64,
+    },
+    /// The configuration violates the `where` condition.
+    Inadmissible,
+    /// A parameter's default has no listed value at the statics, or, as
+    /// the module is checked, may have none on some device.
+    Default {
+        parameter: String,
+        reason: String,
+    },
+    Evaluation(NativeEvalError),
+    /// A range is given for a static dimension, whose value is fixed.
+    RangedStatic(String),
+    /// A range admits no value.
+    EmptyRange {
+        name: String,
+        low: u64,
+        high: u64,
+    },
+    /// The `where` condition reads an element (this read), so the
+    /// configurations are those of the implementation at its bindings
+    /// ([`NativeImplementation::at_elements`]), not of the declaration.
+    Unbound(String),
+}
+
+impl std::fmt::Display for NativeSpecializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingStatic(name) => write!(f, "static dimension `{name}` has no value"),
+            Self::UnknownStatic(name) => write!(f, "`{name}` is not a static dimension"),
+            Self::MissingParameter(name) => write!(f, "native parameter `{name}` has no value"),
+            Self::UnknownParameter(name) => write!(f, "`{name}` is not a native parameter"),
+            Self::OutsideDomain { parameter, value } => {
+                write!(f, "native parameter `{parameter}` does not admit {value}")
+            }
+            Self::MissingLaunchParameter { launch, name } => {
+                write!(f, "launch {launch} parameter `{name}` has no value")
+            }
+            Self::UnknownLaunchParameter { launch, name } => {
+                write!(f, "`{name}` is not a parameter of launch {launch}")
+            }
+            Self::OutsideLaunchDomain {
+                launch,
+                name,
+                value,
+            } => {
+                write!(
+                    f,
+                    "launch {launch} parameter `{name}` does not admit {value}"
+                )
+            }
+            Self::Inadmissible => {
+                f.write_str("configuration violates the native `where` condition")
+            }
+            Self::Default { parameter, reason } => {
+                write!(f, "the default of native parameter `{parameter}` has no value: {reason}")
+            }
+            Self::Evaluation(error) => write!(f, "{error}"),
+            Self::RangedStatic(name) => {
+                write!(f, "`{name}` is a static dimension and takes no range")
+            }
+            Self::EmptyRange { name, low, high } => {
+                write!(f, "the range {low}..={high} of `{name}` admits no value")
+            }
+            Self::Unbound(read) => write!(
+                f,
+                "native `where` reads `{read}`: its configurations are the implementation's at element bindings"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeSpecializationError {}
+
+/// A declaration's scratch bound could not be formed: its statics name no
+/// admitted configuration, or an admitted configuration's charge does not
+/// evaluate (an invariant violation of the declaration).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeScratchBoundError {
+    Specialization(NativeSpecializationError),
+    /// Buffer `scratch` of the admitted configuration with tuning `params`.
+    Charge {
+        scratch: String,
+        params: std::collections::BTreeMap<String, u64>,
+        error: NativeEvalError,
+    },
+}
+
+impl From<NativeSpecializationError> for NativeScratchBoundError {
+    fn from(error: NativeSpecializationError) -> Self {
+        Self::Specialization(error)
+    }
+}
+
+impl std::fmt::Display for NativeScratchBoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Specialization(error) => write!(f, "{error}"),
+            Self::Charge { scratch, params, error } => {
+                write!(f, "scratch `{scratch}` of the admitted configuration {params:?}: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeScratchBoundError {}
+
+impl NativeImplementation {
+    /// Check a complete specialization against the declaration.
+    pub fn validate(
+        &self,
+        specialization: &NativeSpecialization,
+    ) -> Result<(), NativeSpecializationError> {
+        self.enumerable()?;
+        self.validate_enumerable(specialization)
+    }
+
+    /// [`Self::validate`] of an implementation that is enumerable.
+    fn validate_enumerable(
+        &self,
+        specialization: &NativeSpecialization,
+    ) -> Result<(), NativeSpecializationError> {
+        for name in &self.statics {
+            if specialization.static_value(name).is_none() {
+                return Err(NativeSpecializationError::MissingStatic(name.clone()));
+            }
+        }
+        for (name, &(low, high)) in specialization.ranges() {
+            if self.statics.contains(name) {
+                return Err(NativeSpecializationError::RangedStatic(name.clone()));
+            }
+            if low > high {
+                return Err(NativeSpecializationError::EmptyRange {
+                    name: name.clone(),
+                    low,
+                    high,
+                });
+            }
+        }
+        if let Some(name) = specialization
+            .statics()
+            .keys()
+            .find(|name| !self.statics.contains(name))
+        {
+            return Err(NativeSpecializationError::UnknownStatic(name.clone()));
+        }
+        for parameter in &self.params {
+            let value = specialization.param(&parameter.name).ok_or_else(|| {
+                NativeSpecializationError::MissingParameter(parameter.name.clone())
+            })?;
+            if !parameter.values.contains(&value) {
+                return Err(NativeSpecializationError::OutsideDomain {
+                    parameter: parameter.name.clone(),
+                    value,
+                });
+            }
+        }
+        if let Some(name) = specialization
+            .params()
+            .keys()
+            .find(|name| !self.params.iter().any(|parameter| &parameter.name == *name))
+        {
+            return Err(NativeSpecializationError::UnknownParameter(name.clone()));
+        }
+        for (launch, declaration) in self.launches.iter().enumerate() {
+            for parameter in &declaration.params {
+                let value = specialization
+                    .launch_param(launch, &parameter.name)
+                    .ok_or_else(|| NativeSpecializationError::MissingLaunchParameter {
+                        launch,
+                        name: parameter.name.clone(),
+                    })?;
+                if !parameter.values.contains(&value) {
+                    return Err(NativeSpecializationError::OutsideLaunchDomain {
+                        launch,
+                        name: parameter.name.clone(),
+                        value,
+                    });
+                }
+            }
+        }
+        if let Some(((launch, name), _)) =
+            specialization
+                .launch_params()
+                .iter()
+                .find(|((launch, name), _)| {
+                    !self.launches.get(*launch).is_some_and(|declaration| {
+                        declaration
+                            .params
+                            .iter()
+                            .any(|parameter| &parameter.name == name)
+                    })
+                })
+        {
+            return Err(NativeSpecializationError::UnknownLaunchParameter {
+                launch: *launch,
+                name: name.clone(),
+            });
+        }
+        let dimension = |name: &str| specialization.static_value(name);
+        let parameter = |name: &str| {
+            specialization.param(name).or_else(|| {
+                let mut owners =
+                    self.launches
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(launch, declaration)| {
+                            declaration
+                                .params
+                                .iter()
+                                .any(|parameter| parameter.name == name)
+                                .then_some(launch)
+                        });
+                let launch = owners.next()?;
+                owners
+                    .next()
+                    .is_none()
+                    .then(|| specialization.launch_param(launch, name))
+                    .flatten()
+            })
+        };
+        if let Some(constraint) = &self.constraint {
+            if !constraint
+                .holds(&dimension, &parameter)
+                .map_err(NativeSpecializationError::Evaluation)?
+            {
+                return Err(NativeSpecializationError::Inadmissible);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether some call `specialization` admits activates launch `launch`:
+    /// false only when its `when` condition is false at every value of the
+    /// call-time dimensions within the specialization's ranges (a dimension
+    /// without one ranges over every value).
+    pub fn reachable(&self, specialization: &NativeSpecialization, launch: usize) -> bool {
+        let Some(when) = &self.launches[launch].when else {
+            return true;
+        };
+        let dimension = |name: &str| {
+            specialization
+                .static_value(name)
+                .map(|value| (value, value))
+                .or_else(|| specialization.ranges().get(name).copied())
+        };
+        let parameter = |name: &str| {
+            specialization
+                .launch_param(launch, name)
+                .or_else(|| specialization.param(name))
+                .map(|value| (value, value))
+        };
+        when.may_hold(&dimension, &parameter)
+    }
+
+    /// The group size of launch `launch` under `specialization`, when every
+    /// axis reads only static dimensions and parameters (none when one reads
+    /// a call-time dimension).
+    pub fn static_group_size(
+        &self,
+        specialization: &NativeSpecialization,
+        launch: usize,
+    ) -> Option<[u64; 3]> {
+        let declaration = &self.launches[launch];
+        let mut size = [0u64; 3];
+        for (axis, extent) in declaration.group_extent.iter().enumerate() {
+            let mut dimensions = Vec::new();
+            extent.dimensions(&mut dimensions);
+            if dimensions.iter().any(|name| !self.statics.contains(name)) {
+                return None;
+            }
+            size[axis] = extent
+                .evaluate(&|name| specialization.static_value(name), &|name| {
+                    specialization
+                        .launch_param(launch, name)
+                        .or_else(|| specialization.param(name))
+                })
+                .ok()?;
+        }
+        Some(size)
+    }
+
+    /// Every admissible specialization for the given static values: the
+    /// cartesian product of the parameter domains in declaration order,
+    /// filtered by the `where` condition.
+    pub fn admissible(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
+        let mut admissible = Vec::new();
+        self.walk_admissible(statics, |configuration| {
+            admissible.push(configuration.clone());
+            true
+        })?;
+        Ok(admissible)
+    }
+
+    /// Whether the statics lie inside the implementation's domain: some
+    /// configuration is admissible at them (`Inadmissible` when none is).
+    /// Unlike [`OnDevice::default_specialization`] it reads no default, so
+    /// it needs no device.
+    pub fn admits(&self, statics: &NativeSpecialization) -> Result<(), NativeSpecializationError> {
+        let mut admitted = false;
+        self.walk_admissible(statics, |_| {
+            admitted = true;
+            false
+        })?;
+        if admitted {
+            Ok(())
+        } else {
+            Err(NativeSpecializationError::Inadmissible)
+        }
+    }
+
+    /// Each scratch buffer's bound at a call's dimensions (statics among
+    /// them): its largest charge over the configurations the declaration
+    /// admits at those statics ([`Self::walk_admissible`], the admission
+    /// dispatch prepares by), so a configuration the `where` refuses is
+    /// never sized. An admitted configuration whose charge cannot be
+    /// evaluated is an error naming it.
+    ///
+    /// A charge reads only entry-wide parameters, so the walk visits one
+    /// admitted configuration for each admitted assignment of the
+    /// parameters the buffers read ([`Self::walk_admitted_of`]), not the
+    /// product of every domain: the configurations it skips charge what the
+    /// one it visits does.
+    pub fn scratch_bound(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeScratchBoundError> {
+        let mut statics = NativeSpecialization::new();
+        for name in &self.statics {
+            let value = dimension(name)
+                .ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()))?;
+            statics = statics.with_static(name.clone(), value);
+        }
+        let mut read = Vec::new();
+        for buffer in &self.scratch {
+            buffer.parameters(&mut read);
+        }
+        let mut bound = vec![0u64; self.scratch.len()];
+        let mut admitted = false;
+        let mut failure = None;
+        self.walk_admitted_of(&statics, &read, |configuration| {
+            admitted = true;
+            for (buffer, bytes) in self.scratch.iter().zip(&mut bound) {
+                match buffer.charge(dimension, &|name| configuration.param(name)) {
+                    Ok(charge) => *bytes = (*bytes).max(charge),
+                    Err(error) => {
+                        failure = Some(NativeScratchBoundError::Charge {
+                            scratch: buffer.name.clone(),
+                            params: configuration.params().clone(),
+                            error,
+                        });
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        match failure {
+            Some(failure) => Err(failure),
+            None if admitted => Ok(bound),
+            None => Err(NativeSpecializationError::Inadmissible.into()),
+        }
+    }
+
+    /// The declaration with each parameter's values reordered so its
+    /// default at `statics` comes first, the others keeping their declared
+    /// order: the declaration itself where every default is its first value.
+    fn defaults_first(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Result<Cow<'_, Self>, NativeSpecializationError> {
+        let dimension = |name: &str| statics.static_value(name);
+        let default = |parameter: &NativeParameter| {
+            parameter
+                .default
+                .value(&parameter.name, &parameter.values, &dimension)
+        };
+        let parameters = || {
+            self.params
+                .iter()
+                .chain(self.launches.iter().flat_map(|launch| &launch.params))
+        };
+        let mut first = true;
+        for parameter in parameters() {
+            first &= parameter.values.first() == Some(&default(parameter)?);
+        }
+        if first {
+            return Ok(Cow::Borrowed(self));
+        }
+        let ordered = |parameter: &NativeParameter| -> Result<NativeParameter, NativeSpecializationError> {
+            let default = default(parameter)?;
+            let values = std::iter::once(default)
+                .chain(parameter.values.iter().copied().filter(|value| *value != default))
+                .collect();
+            Ok(NativeParameter {
+                values,
+                ..parameter.clone()
+            })
+        };
+        let mut declaration = self.clone();
+        declaration.params = self.params.iter().map(ordered).collect::<Result<_, _>>()?;
+        for (launch, original) in declaration.launches.iter_mut().zip(&self.launches) {
+            launch.params = original.params.iter().map(ordered).collect::<Result<_, _>>()?;
+        }
+        Ok(Cow::Owned(declaration))
+    }
+
+    /// The values a static search tries, most preferred first: powers of two
+    /// up to 4096, then the `where` condition's other literals above one,
+    /// then one and zero.
+    pub fn static_candidates(&self) -> Vec<u64> {
+        let mut literals = std::collections::BTreeSet::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.constants(&mut literals);
+        }
+        let powers = (1..=12).map(|exponent| 1u64 << exponent);
+        let mut candidates: Vec<u64> = powers.clone().collect();
+        candidates.extend(
+            literals
+                .into_iter()
+                .filter(|value| *value > 1 && !powers.clone().any(|power| power == *value)),
+        );
+        candidates.extend([1, 0]);
+        candidates
+    }
+
+    /// The first static values, in [`Self::static_candidates`] order, at
+    /// which every specialization walk succeeds and admits at least one
+    /// configuration, with `fixed` holding the statics it names. A
+    /// depth-first search over the statics in declaration order: every
+    /// top-level conjunct of `where` that the assigned and fixed statics
+    /// decide as false prunes a partial assignment. `None` when no
+    /// assignment over the candidates is admitted; `Unbound` where the
+    /// admitted assignments depend on the element bindings.
+    pub fn search_statics(
+        &self,
+        fixed: &[(&str, u64)],
+    ) -> Result<Option<NativeSpecialization>, NativeSpecializationError> {
+        self.enumerable()?;
+        Ok(self.search(fixed, &|_| None, &|statics| {
+            // A walk that cannot fail succeeds once it admits one.
+            let infallible = self.infallible(statics);
+            let mut admitted = false;
+            self.walk_admissible(statics, |_| {
+                admitted = true;
+                !infallible
+            })
+            .ok()?;
+            admitted.then(|| statics.clone())
+        }))
+    }
+
+    /// The first admissible configuration that holds the tuning parameter
+    /// `name` (of `launch`, or the entry's) at `value`, over the static
+    /// assignments [`Self::search_statics`] walks, in its order: the
+    /// configuration of a form that only some statics admit (a head width,
+    /// say). The value of an entry parameter joins the assigned statics in
+    /// pruning. `None` when no assignment over the candidates admits it;
+    /// `Unbound` where the admitted configurations depend on the element
+    /// bindings.
+    pub fn search_form(
+        &self,
+        launch: Option<usize>,
+        name: &str,
+        value: u64,
+    ) -> Result<Option<NativeSpecialization>, NativeSpecializationError> {
+        self.enumerable()?;
+        let held = |configuration: &NativeSpecialization| match launch {
+            None => configuration.param(name),
+            Some(launch) => configuration.launch_param(launch, name),
+        };
+        // The declaration with the parameter at `value` alone. Where no walk
+        // of this one can fail, the first configuration of its walk is the
+        // first of this one's that holds the value: both walks visit every
+        // configuration of their product the condition admits, in order.
+        let mut holding = self.clone();
+        let parameters = match launch {
+            None => &mut holding.params,
+            Some(launch) => &mut holding.launches[launch].params,
+        };
+        // A walk holds a parameter only at a value of its domain.
+        if !parameters
+            .iter()
+            .any(|parameter| parameter.name == name && parameter.values.contains(&value))
+        {
+            return Ok(None);
+        }
+        for parameter in parameters
+            .iter_mut()
+            .filter(|parameter| parameter.name == name)
+        {
+            parameter.values = vec![value];
+        }
+        let parameter = |parameter: &str| (launch.is_none() && parameter == name).then_some(value);
+        // The statics are searched under the parameter domains a
+        // configuration holding the value can have: those it alone narrows,
+        // at no statics (`RESIDUE == 2` needs `PACK == 1`, which needs
+        // `D % 256 == 0`). Every assignment those domains refute admits no
+        // such configuration, so the first assignment found is the same,
+        // and none is searched for a value no configuration holds.
+        let Some(narrowed) = holding.narrowed(&NativeSpecialization::new()) else {
+            return Ok(None);
+        };
+        Ok(narrowed.search(&[], &parameter, &|statics| {
+            let mut found = None;
+            if self.infallible(statics) {
+                holding
+                    .walk_admissible(statics, |configuration| {
+                        if held(configuration) == Some(value) {
+                            found = Some(configuration.clone());
+                        }
+                        found.is_none()
+                    })
+                    .ok()?;
+            } else {
+                self.walk_admissible(statics, |configuration| {
+                    if held(configuration) == Some(value) {
+                        found = Some(configuration.clone());
+                    }
+                    found.is_none()
+                })
+                .ok()?;
+            }
+            found
+        }))
+    }
+
+    /// The bounds of every tuning parameter a specialization walk resolves
+    /// by name: the entry's and the launches' that no other declares.
+    fn parameter_bounds(&self) -> std::collections::BTreeMap<&str, Option<(u64, u64)>> {
+        let mut bounds = std::collections::BTreeMap::<&str, Option<(u64, u64)>>::new();
+        for parameter in self
+            .params
+            .iter()
+            .chain(self.launches.iter().flat_map(|launch| &launch.params))
+        {
+            let range = parameter
+                .values
+                .iter()
+                .min()
+                .zip(parameter.values.iter().max())
+                .map(|(least, greatest)| (*least, *greatest));
+            bounds
+                .entry(parameter.name.as_str())
+                .and_modify(|bound| *bound = None)
+                .or_insert(range);
+        }
+        bounds
+    }
+
+    /// Whether the `where` condition can hold at some configuration of the
+    /// parameter domains with each static dimension within the inclusive
+    /// bounds `statics` supplies: false only where it is false throughout
+    /// ([`NativeCondition::may_hold`]).
+    pub fn may_admit(&self, statics: &impl Fn(&str) -> Option<(u64, u64)>) -> bool {
+        let Some(constraint) = &self.constraint else {
+            return true;
+        };
+        let bounds = self.parameter_bounds();
+        constraint.may_hold(statics, &|name| bounds.get(name).copied().flatten())
+    }
+
+    /// Whether the `where` condition evaluates without failing at `statics`
+    /// under every configuration of the parameter domains. A walk at such
+    /// statics never fails: it visits exactly the configurations of the
+    /// product the condition admits, in order, and so does a walk of the
+    /// declaration with any parameter's domain narrowed.
+    pub fn infallible(&self, statics: &NativeSpecialization) -> bool {
+        let Some(constraint) = &self.constraint else {
+            return true;
+        };
+        let bounds = self.parameter_bounds();
+        constraint.bounded(
+            &|name| statics.static_value(name).map(|value| (value, value)),
+            &|name| bounds.get(name).copied().flatten(),
+        ) != NativeBounded::Fallible
+    }
+
+    /// The declaration with each tuning parameter's domain narrowed to the
+    /// values some configuration a walk at `statics` admits can hold, or
+    /// `None` when it admits none. A value goes when a top-level conjunct of
+    /// `where` is false at `statics` under every configuration of the domains
+    /// holding it, until none goes: a walk evaluates the conjunct on each
+    /// configuration it does not skip, and skips only configurations sharing
+    /// a rejected one's values of it, so it admits none holding the value.
+    /// The walk of the narrowed declaration admits the same configurations
+    /// in the same order wherever the condition cannot fail.
+    pub fn narrowed(&self, statics: &NativeSpecialization) -> Option<Self> {
+        let mut conjuncts = Vec::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.conjuncts(&mut conjuncts);
+        }
+        let mut narrowed = self.clone();
+        let dimension = |name: &str| statics.static_value(name).map(|value| (value, value));
+        loop {
+            let bounds = narrowed
+                .parameter_bounds()
+                .into_iter()
+                .map(|(name, bound)| (name.to_owned(), bound))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let refuted = |held: Option<(&str, u64)>| {
+                let parameter = |name: &str| match held {
+                    Some((held, value)) if held == name => Some((value, value)),
+                    _ => bounds.get(name).copied().flatten(),
+                };
+                conjuncts.iter().any(|conjunct| {
+                    conjunct.bounded(&dimension, &parameter) == NativeBounded::Always(false)
+                })
+            };
+            if refuted(None) {
+                return None;
+            }
+            let mut changed = false;
+            for parameter in narrowed.params.iter_mut().chain(
+                narrowed
+                    .launches
+                    .iter_mut()
+                    .flat_map(|launch| launch.params.iter_mut()),
+            ) {
+                if parameter.values.len() < 2
+                    || bounds.get(&parameter.name).copied().flatten().is_none()
+                {
+                    continue;
+                }
+                let before = parameter.values.len();
+                let name = parameter.name.clone();
+                parameter
+                    .values
+                    .retain(|value| !refuted(Some((&name, *value))));
+                if parameter.values.is_empty() {
+                    return None;
+                }
+                changed |= parameter.values.len() < before;
+            }
+            if !changed {
+                return Some(narrowed);
+            }
+        }
+    }
+
+    /// The first complete static assignment, in candidate order, at which
+    /// `found` yields: statics in declaration order, `fixed` holding the
+    /// ones it names, a partial assignment pruned when it, the fixed statics
+    /// and `parameter` decide a top-level conjunct of `where` as false.
+    ///
+    /// Two further prunings skip only assignments at which `found` cannot
+    /// yield, so the first one found is the same. A top-level conjunct that
+    /// reads only known statics and parameters a walk resolves, and that is
+    /// false under every value of their domains (`parameter` holding the ones
+    /// it supplies), rejects every configuration of every walk below: the
+    /// walk evaluates it on each configuration it does not skip, and skips
+    /// only configurations sharing a rejected one's values of it. And whether
+    /// `found` yields depends on the statics only through the `where`
+    /// condition, which is all a walk reads of them, so a static the
+    /// condition does not read is tried at its first candidate only.
+    fn search(
+        &self,
+        fixed: &[(&str, u64)],
+        parameter: &dyn Fn(&str) -> Option<u64>,
+        found: &dyn Fn(&NativeSpecialization) -> Option<NativeSpecialization>,
+    ) -> Option<NativeSpecialization> {
+        let mut conjuncts = Vec::new();
+        let mut read = Vec::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.conjuncts(&mut conjuncts);
+            constraint.dimensions(&mut read);
+        }
+        let candidates = self.static_candidates();
+        let domains = self
+            .statics
+            .iter()
+            .map(
+                |name| match fixed.iter().find(|(candidate, _)| *candidate == name) {
+                    Some((_, value)) => (vec![*value], true),
+                    None if read.contains(name) => (candidates.clone(), false),
+                    None => (vec![candidates[0]], false),
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut assigned = self
+            .statics
+            .iter()
+            .zip(&domains)
+            .filter(|(_, (_, fixed))| *fixed)
+            .map(|(name, (values, _))| (name.clone(), values[0]))
+            .collect();
+        let bounds = self.parameter_bounds();
+        let bounds = |name: &str| {
+            let bound = bounds.get(name).copied().flatten()?;
+            Some(parameter(name).map_or(bound, |value| (value, value)))
+        };
+        let reads = conjuncts
+            .iter()
+            .map(|conjunct| {
+                let mut names = Vec::new();
+                conjunct.dimensions(&mut names);
+                self.statics
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| names.contains(name))
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .collect();
+        let search = Search {
+            domains,
+            conjuncts,
+            reads,
+            parameter,
+            bounds: &bounds,
+            found,
+        };
+        self.search_from(0, &search, &mut assigned)
+    }
+
+    /// Whether no assignment extending `assigned` can yield: a top-level
+    /// conjunct is refuted at `assigned`, or every value of one further
+    /// static is refuted by some conjunct that reads no other.
+    fn refuted(
+        &self,
+        search: &Search<'_>,
+        assigned: &std::collections::BTreeMap<String, u64>,
+    ) -> bool {
+        let refutes = |conjunct: &NativeCondition, open: Option<(&str, u64)>| {
+            let dimension = |dimension: &str| match open {
+                Some((name, value)) if name == dimension => Some(value),
+                _ => assigned.get(dimension).copied(),
+            };
+            let known = |name: &str| dimension(name).map(|value| (value, value));
+            conjunct.decided(&dimension, &search.parameter) == Some(false)
+                || conjunct.bounded(&known, &search.bounds) == NativeBounded::Always(false)
+        };
+        // The values of each static not yet assigned that no conjunct refutes.
+        let mut open: Vec<Option<Vec<bool>>> = vec![None; self.statics.len()];
+        for (conjunct, reads) in search.conjuncts.iter().zip(&search.reads) {
+            if refutes(conjunct, None) {
+                return true;
+            }
+            let mut unknown = reads
+                .iter()
+                .filter(|index| !assigned.contains_key(&self.statics[**index]));
+            match (unknown.next(), unknown.next()) {
+                (Some(&index), None) => {
+                    let values = &search.domains[index].0;
+                    let alive = open[index].get_or_insert_with(|| vec![true; values.len()]);
+                    for (alive, value) in alive.iter_mut().zip(values) {
+                        if *alive && refutes(conjunct, Some((&self.statics[index], *value))) {
+                            *alive = false;
+                        }
+                    }
+                    if !alive.contains(&true) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn search_from(
+        &self,
+        depth: usize,
+        search: &Search<'_>,
+        assigned: &mut std::collections::BTreeMap<String, u64>,
+    ) -> Option<NativeSpecialization> {
+        let Some(name) = self.statics.get(depth) else {
+            let statics = assigned
+                .iter()
+                .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                    statics.with_static(name.clone(), *value)
+                });
+            return (search.found)(&statics);
+        };
+        let (values, fixed) = &search.domains[depth];
+        for &value in values {
+            assigned.insert(name.clone(), value);
+            if !self.refuted(search, assigned) {
+                if let Some(found) = self.search_from(depth + 1, search, assigned) {
+                    return Some(found);
+                }
+            }
+        }
+        if !fixed {
+            assigned.remove(name);
+        }
+        None
+    }
+
+    /// Visit the admissible specializations at `statics` in declaration
+    /// order until `visit` returns false. A caller that needs a few of them
+    /// (the nearest to one, the distinct values of a field) takes them here:
+    /// their number is the product of the parameter domains, which
+    /// [`Self::admissible`] holds all at once.
+    pub fn walk_admissible(
+        &self,
+        statics: &NativeSpecialization,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk_admissible_while(statics, || true, visit)
+    }
+
+    /// Cancellation is checked for rejected prefixes too, so a sparse legal
+    /// domain cannot strand its caller between admissible configurations.
+    pub fn walk_admissible_while(
+        &self,
+        statics: &NativeSpecialization,
+        keep_going: impl FnMut() -> bool,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk(statics, None, keep_going, visit)
+    }
+
+    /// Visit, until `visit` returns false, the first admissible
+    /// configuration at `statics` holding each admitted assignment of the
+    /// entry-wide parameters `leading` names (names it holds that are not
+    /// one are ignored): what a caller reading only those parameters can
+    /// tell apart, with no walk over the product of the others once one of
+    /// their completions is admitted. The assignments come in the order of
+    /// the walk of [`Self::walk_admissible`] with those parameters moved
+    /// first, keeping their declared order.
+    pub fn walk_admitted_of(
+        &self,
+        statics: &NativeSpecialization,
+        leading: &[String],
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk(statics, Some(leading), || true, visit)
+    }
+
+    /// The walk of [`Self::walk_admissible_while`], or, with `leading`,
+    /// that of [`Self::walk_admitted_of`]: the named entry-wide parameters
+    /// walked first, and each admitted configuration ending the walk over
+    /// the parameters after them.
+    fn walk(
+        &self,
+        statics: &NativeSpecialization,
+        leading: Option<&[String]>,
+        mut keep_going: impl FnMut() -> bool,
+        mut visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.enumerable()?;
+        let mut base = NativeSpecialization::new();
+        for name in &self.statics {
+            let value = statics
+                .static_value(name)
+                .ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()))?;
+            base = base.with_static(name.clone(), value);
+        }
+        if let Some(name) = statics
+            .statics()
+            .keys()
+            .find(|name| !self.statics.contains(name))
+        {
+            return Err(NativeSpecializationError::UnknownStatic(name.clone()));
+        }
+        // The entry-wide parameters `leading` names first, in declared order.
+        let led = |parameter: &&NativeParameter| {
+            leading.is_some_and(|leading| leading.contains(&parameter.name))
+        };
+        let lead = leading.map(|_| self.params.iter().filter(led).count());
+        let domains = self
+            .params
+            .iter()
+            .filter(led)
+            .chain(self.params.iter().filter(|parameter| !led(parameter)))
+            .map(|parameter| (None, parameter))
+            .chain(
+                self.launches
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(launch, declaration)| {
+                        declaration
+                            .params
+                            .iter()
+                            .map(move |parameter| (Some(launch), parameter))
+                    }),
+            )
+            .collect::<Vec<_>>();
+        // The values each parameter is walked over: an entry-wide parameter
+        // `statics` values is walked at that value alone.
+        let values = domains
+            .iter()
+            .map(|(launch, parameter)| {
+                match launch.is_none().then(|| statics.param(&parameter.name)).flatten() {
+                    Some(value) if parameter.values.contains(&value) => Ok(vec![value]),
+                    Some(value) => Err(NativeSpecializationError::OutsideDomain {
+                        parameter: parameter.name.clone(),
+                        value,
+                    }),
+                    None => Ok(parameter.values.clone()),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Walk the product of the parameter domains in place (the last
+        // parameter varies fastest), keeping each admissible configuration.
+        let mut configuration = base;
+        for ((launch, parameter), values) in domains.iter().zip(&values) {
+            configuration = match launch {
+                None => configuration.with_param(parameter.name.clone(), values[0]),
+                Some(launch) => {
+                    configuration.with_launch_param(*launch, parameter.name.clone(), values[0])
+                }
+            };
+        }
+        // The `where` condition's top-level conjuncts, each with the last
+        // parameter of the walk it reads: a conjunct that fails rejects every
+        // configuration with the same values up to that parameter, so the
+        // walk steps over them at once rather than visiting the product of
+        // the parameters after it.
+        let mut owners = std::collections::BTreeMap::<&str, Option<usize>>::new();
+        for (position, (_, parameter)) in domains.iter().enumerate() {
+            owners
+                .entry(parameter.name.as_str())
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(position));
+        }
+        let owner = |name: &str| owners.get(name).copied().flatten();
+        let mut conjuncts = Vec::new();
+        if let Some(constraint) = &self.constraint {
+            constraint.conjuncts(&mut conjuncts);
+        }
+        // A conjunct that reads no parameter is decided by the statics alone.
+        let mut fixed = 0;
+        for conjunct in &conjuncts {
+            let mut names = Vec::new();
+            conjunct.parameters(&mut names);
+            if !names.is_empty() {
+                continue;
+            }
+            match conjunct.holds(&|name| configuration.static_value(name), &|_| None) {
+                Ok(true) => fixed += 1,
+                Ok(false) => return Ok(()),
+                Err(_) => {}
+            }
+        }
+        let total = conjuncts.len() - fixed;
+        let prefixes = conjuncts
+            .into_iter()
+            .filter_map(|conjunct| {
+                let mut names = Vec::new();
+                conjunct.parameters(&mut names);
+                let positions = names
+                    .iter()
+                    .map(|name| owner(name))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((positions.into_iter().max()?, conjunct))
+            })
+            .collect::<Vec<_>>();
+        // The walk values every declared parameter from its domain, so a
+        // configuration no conjunct rejects is admissible once every
+        // conjunct is one of these; otherwise the whole condition decides.
+        let decided = prefixes.len() == total;
+        let launch_keys = domains
+            .iter()
+            .map(|(launch, parameter)| launch.map(|launch| (launch, parameter.name.clone())))
+            .collect::<Vec<_>>();
+        let mut steps = vec![0usize; domains.len()];
+        // The first parameter the last step changed: a conjunct that reads
+        // only parameters before it held on the configuration before, and
+        // still does.
+        let mut changed = 0;
+        loop {
+            if !keep_going() {
+                return Ok(());
+            }
+            let dimension = |name: &str| configuration.static_value(name);
+            let parameter = |name: &str| {
+                let (launch, _) = domains[owner(name)?];
+                match launch {
+                    None => configuration.param(name),
+                    Some(launch) => configuration.launch_param(launch, name),
+                }
+            };
+            // The shortest prefix the walk is done with: one a conjunct
+            // rejects, or the leading parameters of an admitted configuration.
+            let mut rejected: Option<usize> = None;
+            let mut failed = false;
+            for (last, conjunct) in &prefixes {
+                if *last < changed {
+                    continue;
+                }
+                match conjunct.holds(&dimension, &parameter) {
+                    Ok(true) => {}
+                    Ok(false) => rejected = Some(rejected.map_or(*last, |least| least.min(*last))),
+                    Err(_) => failed = true,
+                }
+            }
+            if rejected.is_none() {
+                let admitted = if decided && !failed {
+                    Ok(())
+                } else {
+                    self.validate_enumerable(&configuration)
+                };
+                match admitted {
+                    Ok(()) => {
+                        if !visit(&configuration) {
+                            return Ok(());
+                        }
+                        if let Some(lead) = lead {
+                            if lead == 0 {
+                                return Ok(());
+                            }
+                            rejected = Some(lead - 1);
+                        }
+                    }
+                    Err(NativeSpecializationError::Inadmissible) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(position) = (0..rejected.map_or(domains.len(), |last| last + 1))
+                .rev()
+                .find(|&position| steps[position] + 1 < values[position].len())
+            else {
+                return Ok(());
+            };
+            let next = steps[position] + 1;
+            let mut set = |position: usize, step: usize| {
+                steps[position] = step;
+                let (launch, parameter) = domains[position];
+                let value = values[position][step];
+                match launch {
+                    None => {
+                        *configuration
+                            .params
+                            .get_mut(&parameter.name)
+                            .expect("every parameter was valued") = value;
+                    }
+                    Some(_) => {
+                        *configuration
+                            .launch_params
+                            .get_mut(launch_keys[position].as_ref().expect("a launch parameter"))
+                            .expect("every launch parameter was valued") = value;
+                    }
+                }
+            };
+            for reset in position + 1..domains.len() {
+                set(reset, 0);
+            }
+            set(position, next);
+            changed = position;
+        }
+    }
+}
+
+/// One static search: each static's values, in declaration order (with
+/// whether it is fixed), the `where` condition's top-level conjuncts with
+/// the statics each reads, the parameter values supplied and the parameter
+/// bounds they narrow.
+struct Search<'s> {
+    domains: Vec<(Vec<u64>, bool)>,
+    conjuncts: Vec<&'s NativeCondition>,
+    reads: Vec<Vec<usize>>,
+    parameter: &'s dyn Fn(&str) -> Option<u64>,
+    bounds: &'s dyn Fn(&str) -> Option<(u64, u64)>,
+    found: &'s dyn Fn(&NativeSpecialization) -> Option<NativeSpecialization>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterSummary {
+    /// Authored parameter ordinal and tuple path. The summary is leaf-flat;
+    /// generated bindings group leaves by these canonical coordinates.
+    pub source: u32,
+    pub path: Vec<u32>,
+    pub name: String,
+    pub kind: ParameterSummaryKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParameterSummaryKind {
+    Tensor {
+        access: TensorAccess,
+        rank: u32,
+        element: ElementSummary,
+    },
+    Scalar(DType),
+    Index,
+    Range,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TensorAccess {
+    Owned,
+    Shared,
+    Mutable,
+    /// A host port (`&host tensor`, `&host mut tensor`): the host reads it,
+    /// or rewrites it (`write`), once it sees the launch; the kernel never
+    /// accesses it.
+    Host { write: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementSummary {
+    /// A fixed dtype or packed representation, by registry name.
+    Fixed(String),
+    /// Bound at `for_device` time by an element parameter name.
+    Parameter(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultSummary {
+    /// Ordinal tuple path; empty for a non-tuple result.
+    pub path: Vec<u32>,
+    pub kind: ResultSummaryKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResultSummaryKind {
+    Tensor { rank: u32, element: ElementSummary },
+    Scalar(DType),
+    Index,
+    Range,
+}
+
+impl ResultSummaryKind {
+    pub fn class(&self) -> ResultClass {
+        match self {
+            Self::Tensor { .. } => ResultClass::Tensor,
+            Self::Scalar(_) => ResultClass::Scalar,
+            Self::Index => ResultClass::Index,
+            Self::Range => ResultClass::Range,
+        }
+    }
+}
+
+pub(crate) mod internals {
+    //! W1-owned. Must satisfy: private arenas, region-qualified node ids,
+    //! typed registry ids, content-derived stable identities, and no
+    //! constructor reachable from outside `seismic-lang` other than
+    //! `check` and the bundle decoder. Every field other than the owners,
+    //! the semantic hash and the sources is the bundle's checked section.
+
+    use super::{Diagnostics, EntryInfo, NativeImplementation, SourceError, SourceSet};
+    use crate::entry::{ElementBindings, LogicalEntry};
+    use crate::ids::{EntryId, ModuleHash, ModuleId, ProgramId};
+
+    #[derive(Debug)]
+    pub(crate) struct Module {
+        pub(crate) id: ModuleId,
+        /// The owner of every `FunctionId` and `FamilyId` below.
+        pub(crate) program: ProgramId,
+        pub(crate) semantic_hash: ModuleHash,
+        /// Shared with every entry built from the module (its program's
+        /// subject), never copied per entry.
+        pub(crate) sources: std::sync::Arc<SourceSet>,
+        pub(crate) entries: Vec<EntryInfo>,
+        pub(crate) native_implementations: Vec<NativeImplementation>,
+        pub(crate) entry_families: Vec<usize>,
+        pub(crate) definitions: Vec<crate::check::ir::Definition>,
+        pub(crate) families: Vec<crate::check::ir::Family>,
+        /// The module constants (`const NAME = INTEGER`), in source order.
+        pub(crate) constants: Vec<(String, u64)>,
+    }
+
+    pub(crate) fn check<E>(
+        sources: SourceSet,
+        read: &mut super::NativeReader<'_, E>,
+    ) -> Result<(Module, super::NativeSources), super::CheckFailure<E>> {
+        let id = ModuleId::fresh();
+        crate::check::check_closed(sources, id, ProgramId::fresh(), read)
+    }
+
+    impl Module {
+        pub(crate) fn semantic_hash(&self) -> ModuleHash {
+            self.semantic_hash
+        }
+        pub(crate) fn entries(&self) -> &[EntryInfo] {
+            &self.entries
+        }
+        pub(crate) fn entry(
+            &self,
+            entry: EntryId,
+            bindings: &ElementBindings,
+        ) -> Result<LogicalEntry, SourceError> {
+            assert_eq!(
+                entry.module(),
+                self.id,
+                "CheckedModule received an EntryId owned by another module (§13.3.2)"
+            );
+            assert!(
+                entry.index() < self.entries.len(),
+                "CheckedModule received an EntryId outside its entry arena (§13.3.2)"
+            );
+            crate::check::build_entry(self, entry, bindings)
+                .map_err(|diagnostic| SourceError::new(Diagnostics::single(diagnostic)))
+        }
+        pub(crate) fn sources(&self) -> &SourceSet {
+            &self.sources
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeat_block_dispatches_in_order_and_only_on_metal() {
+        let check = |target: &str| {
+            let launch = |name: &str, indent: &str| {
+                format!(
+                    "{indent}launch {name}:\n{indent}    threadgroups (1, 1, 1)\n{indent}    threads_per_threadgroup (1, 1, 1)\n"
+                )
+            };
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for {target} from \"scale.{target}\":\n{}    repeat (ceil_div(N, 4)):\n{}{}{}",
+                    launch("prepare", "    "),
+                    launch("decode", "        "),
+                    launch("attend", "        "),
+                    launch("merge", "    "),
+                ),
+            }]))
+        };
+        let module = check("metal").unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert_eq!(
+            native.dispatch_order(2).collect::<Vec<_>>(),
+            [0, 1, 2, 1, 2, 3]
+        );
+        assert_eq!(native.dispatch_order(0).collect::<Vec<_>>(), [0, 3]);
+        let refused = format!("{:?}", check("cuda").err().unwrap());
+        assert!(
+            refused.contains("`repeat` is not implemented for cuda"),
+            "{refused}"
+        );
+    }
+
+    /// Terms are names for expressions: a declaration that names them checks
+    /// to the implementation of the one that writes them out, wherever a
+    /// native expression or condition may stand.
+    #[test]
+    fn named_terms_check_to_the_declaration_that_writes_them_out() {
+        let check = |body: &str| {
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    static (N)\n    params (PARTS in [1, 2, 4] default 1)\n{body}"
+                ),
+            }]))
+            .map_err(|error| format!("{error:?}"))?;
+            Ok::<_, String>(
+                module
+                    .native_implementation(module.entries()[0].id, BackendName::Metal)
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let named = check(
+            "    let MOST = ceil_div(64, N)\n    let SPARE = (MOST - PARTS) * N - 1\n    let ROUNDS = max(1, ceil_div(N, SPARE))\n    where PARTS <= MOST\n    scratch window bytes (SPARE * 4) when ROUNDS > 1\n    launch prepare when ROUNDS > 1:\n        threadgroups (MOST, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes (SPARE)\n    repeat (ROUNDS):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min(SPARE, 32), 1, 1)\n",
+        )
+        .unwrap();
+        let written = check(
+            "    where PARTS <= ceil_div(64, N)\n    scratch window bytes (((ceil_div(64, N) - PARTS) * N - 1) * 4) when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1\n    launch prepare when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1:\n        threadgroups (ceil_div(64, N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes ((ceil_div(64, N) - PARTS) * N - 1)\n    repeat (max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1))):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min((ceil_div(64, N) - PARTS) * N - 1, 32), 1, 1)\n",
+        )
+        .unwrap();
+        // Each source is its own module; everything else is equal.
+        assert_eq!(
+            named,
+            NativeImplementation {
+                entry: named.entry,
+                ..written
+            }
+        );
+
+        let launch = "    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for (terms, message) in [
+            (
+                "    let N = 4\n",
+                "term `N` is already a dimension, a parameter or a term",
+            ),
+            ("    let PARTS = 4\n", "term `PARTS` is already"),
+            ("    let A = 1\n    let A = 2\n", "term `A` is already"),
+            ("    let A = B + 1\n    let B = 2\n", "references `B`"),
+            ("    let A = ROWS\n", "references `ROWS`"),
+        ] {
+            let refused = check(&format!("{terms}{launch}")).unwrap_err();
+            assert!(refused.contains(message), "{terms}: {refused}");
+        }
+    }
+
+    #[test]
+    fn scratch_charge_evaluates_guards_and_charges_exactly() {
+        let rows = || NativeNatExpr::Dimension("M".into());
+        let scratch = NativeScratch {
+            name: "groups".into(),
+            bytes: NativeNatExpr::Mul(Box::new(rows()), Box::new(NativeNatExpr::Constant(4))),
+            sync: false,
+            when: Some(NativeCondition::And(
+                Box::new(NativeCondition::Compare {
+                    comparison: NativeComparison::Gt,
+                    left: rows(),
+                    right: NativeNatExpr::Constant(16),
+                }),
+                Box::new(NativeCondition::Compare {
+                    comparison: NativeComparison::Le,
+                    left: rows(),
+                    right: NativeNatExpr::Constant(64),
+                }),
+            )),
+        };
+        let at = |value: u64| {
+            scratch
+                .charge(&|name| (name == "M").then_some(value), &|_| None)
+                .unwrap()
+        };
+        assert_eq!([at(16), at(32), at(64), at(128)], [1, 128, 256, 1]);
+        assert_eq!(scratch.dimensions(), vec!["M".to_owned()]);
+        let overflow = NativeScratch {
+            name: "overflow".into(),
+            bytes: NativeNatExpr::Mul(
+                Box::new(rows()),
+                Box::new(NativeNatExpr::Constant(u64::MAX)),
+            ),
+            sync: false,
+            when: None,
+        };
+        assert_eq!(
+            overflow.charge(&|_| Some(2), &|_| None),
+            Err(NativeEvalError::Arithmetic)
+        );
+    }
+
+    fn source(native: &str) -> SourceSet {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "ops.seismic".to_owned(),
+            text: format!(
+                "fn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] * factor\n\n{native}"
+            ),
+        });
+        sources
+    }
+
+    #[test]
+    fn observed_composed_products_survive_entry_monomorphization() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "shapes.seismic".into(),
+            text: "fn dimensions[NK, GV, W](q: &tensor[(2 * NK + NK * GV) * W] f32, p: &tensor[NK * GV] f32, w: &tensor[W] f32):\n    let value = w[0]\n".into(),
+        });
+        let module = check_source(sources).expect("composed observations determine dimensions");
+        let entry = module
+            .entry(
+                module.entry_named("dimensions").unwrap(),
+                &ElementBindings::default(),
+            )
+            .expect("monomorphization retains the same dimension equations");
+        let plan = entry
+            .schema()
+            .compile_dimension_inference(entry.arena(), &crate::expr::PartialAssignment::new());
+        let mut values = crate::expr::compiled::InvocationValues::new();
+        plan.infer(&[40, 6, 4], &mut values)
+            .expect("all dimensions solve before checking original equations");
+        assert!(
+            plan.infer(
+                &[41, 6, 4],
+                &mut crate::expr::compiled::InvocationValues::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn private_parallel_storage_does_not_require_shared_write_authority() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "private.seismic".into(),
+            text: "fn update[N, W](x: &tensor[N, W] f32, output: &mut tensor[N, W] f32):\n    parallel for i in 0..N:\n        let mut row = to_owned(x[i])\n        for j in 0..W:\n            row[j] = row[j] + 1.0\n        output[i] = row\n".into(),
+        });
+        let module = check_source(sources).expect("private writes and disjoint publication check");
+        module
+            .entry(
+                module.entry_named("update").unwrap(),
+                &ElementBindings::default(),
+            )
+            .expect("lowering preserves checked private and shared ownership");
+    }
+
+    #[test]
+    fn shared_parallel_storage_still_requires_disjoint_writes() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "shared.seismic".into(),
+            text: "fn update[N](output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[0] = 1.0\n".into(),
+        });
+        assert!(check_source(sources).is_err());
+    }
+
+    #[test]
+    fn native_implementation_attaches_to_the_portable_entry() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
+        ))
+        .expect("native declaration should check");
+        let entry = &module.entries()[0];
+        let native = module
+            .native_implementation(entry.id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(entry.dimensions, ["N"]);
+        assert_eq!(native.source_path, "scale.metal");
+        assert_eq!(native.launches.len(), 1);
+        assert_eq!(native.launches[0].kernel, "scale");
+        assert!(matches!(
+            native.launches[0].groups[0],
+            NativeNatExpr::CeilDiv(_, _)
+        ));
+        assert_eq!(native.launches[0].shared_bytes, NativeNatExpr::Constant(0));
+    }
+
+    const SPECIALIZED: &str = "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic PARTS in [1, 2, 4] default 1, WIDTH in [64, 128] default 64)\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n";
+
+    #[test]
+    fn specialized_multi_launch_declaration_checks() {
+        let module = check_source(source(SPECIALIZED)).expect("specialized declaration checks");
+        let entry = &module.entries()[0];
+        let native = module
+            .native_implementation(entry.id, BackendName::Cuda)
+            .expect("cuda native implementation");
+        assert_eq!(native.statics, ["N"]);
+        assert_eq!(native.params.len(), 2);
+        assert!(native.params[0].arithmetic);
+        assert!(!native.params[1].arithmetic);
+        assert_eq!(native.params[1].values, [64, 128]);
+        assert!(matches!(native.constraint, Some(NativeCondition::And(..))));
+        assert_eq!(native.scratch[0].name, "partials");
+        assert_eq!(native.launches.len(), 2);
+        assert_eq!(native.launches[1].kernel, "scale_merge");
+    }
+
+    #[test]
+    fn launch_parameters_have_independent_scopes_and_domains() {
+        let module = crate::native_source::check_fixture(source(
+            "native scale for metal from \"scale.metal\":\n    params (BOUND in [8, 16] default 8)\n    launch small when N < BOUND:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= BOUND:\n        params (ROWS in [4, 8] default 4)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ), &[])
+        .expect("launch-local parameters check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        assert_eq!(configurations.len(), 8);
+        let default = native
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .unwrap();
+        assert_eq!(default.launch_param(0, "ROWS"), Some(1));
+        assert_eq!(default.launch_param(1, "ROWS"), Some(4));
+        assert!(matches!(
+            native.validate(&default.clone().with_launch_param(1, "ROWS", 2)),
+            Err(NativeSpecializationError::OutsideLaunchDomain { launch: 1, .. })
+        ));
+    }
+
+    /// A range on a call-time dimension leaves unreachable exactly the
+    /// launches no value in it activates; static and empty ranges are refused.
+    #[test]
+    fn a_range_reaches_only_the_launches_its_values_activate() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    launch small when N < 8:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= 8:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .expect("conditional launches check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let reached = |specialization: &NativeSpecialization| {
+            native.validate(specialization).unwrap();
+            [0, 1].map(|launch| native.reachable(specialization, launch))
+        };
+        assert_eq!(reached(&NativeSpecialization::new()), [true, true]);
+        assert_eq!(
+            reached(&NativeSpecialization::new().with_range("N", 1, 7)),
+            [true, false]
+        );
+        assert_eq!(
+            reached(&NativeSpecialization::new().with_range("N", 8, 8)),
+            [false, true]
+        );
+        assert_eq!(
+            reached(&NativeSpecialization::new().with_range("N", 7, 8)),
+            [true, true]
+        );
+        assert!(matches!(
+            native.validate(&NativeSpecialization::new().with_range("N", 5, 4)),
+            Err(NativeSpecializationError::EmptyRange { .. })
+        ));
+        let fixed = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    launch all:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .expect("static native checks");
+        let fixed = fixed
+            .native_implementation(fixed.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(matches!(
+            fixed.validate(&NativeSpecialization::new().with_static("N", 4).with_range("N", 4, 4)),
+            Err(NativeSpecializationError::RangedStatic(name)) if name == "N"
+        ));
+    }
+
+    #[test]
+    fn ordinary_boolean_shape_domain_is_retained_and_not_split() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "boolean-domain.seismic".into(),
+            text: "fn choose[N, FLAG](x: &tensor[N] f32, flag: &tensor[FLAG + 1] f32) -> tensor[N] f32 where FLAG >= 0 and (FLAG == 0 or FLAG == 1):\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n".into(),
+        }])).unwrap();
+        let logical = module
+            .entry(
+                module.entry_named("choose").unwrap(),
+                &ElementBindings::new(),
+            )
+            .unwrap();
+        let predicate = logical
+            .arena()
+            .compile_bool(logical.domain().predicate().node());
+        let mut values = crate::expr::compiled::InvocationValues::new();
+        for dimension in logical.schema().dimensions() {
+            values.bind(dimension.symbol, crate::expr::SymbolValue::Nat(1u64.into()));
+        }
+        let flag = logical
+            .schema()
+            .dimensions()
+            .iter()
+            .find(|dimension| dimension.name == "FLAG")
+            .unwrap()
+            .symbol;
+        for (value, admitted) in [(0u64, true), (1, true), (2, false)] {
+            values.bind(flag, crate::expr::SymbolValue::Nat(value.into()));
+            assert_eq!(predicate.evaluate(&values).unwrap(), admitted);
+        }
+        let rejected = check_source(SourceSet::new(vec![SourceFile {
+            path: "boolean-call.seismic".into(),
+            text: "fn zero_only[N, FLAG](x: &tensor[N] f32) -> tensor[N] f32 where FLAG >= 0 and FLAG == 0:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nfn unsafe_call[N, FLAG](x: &tensor[N] f32) -> tensor[N] f32 where FLAG >= 0 and (FLAG == 0 or FLAG == 1):\n    return zero_only[FLAG = FLAG](x)\n".into(),
+        }]));
+        assert!(
+            rejected.is_err(),
+            "a disjunction cannot establish its zero arm"
+        );
+    }
+
+    #[test]
+    fn integer_min_max_uses_exact_quantity_semantics() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "integer-min-max.seismic".into(),
+            text: "fn cap[N](x: &tensor[N] f32) -> i32:\n    return i32(min(N, max(2, 4)))\n"
+                .into(),
+        }]))
+        .unwrap();
+        assert!(
+            module
+                .entry(module.entry_named("cap").unwrap(), &ElementBindings::new())
+                .is_ok()
+        );
+    }
+
+
+
+
+
+    #[test]
+    fn launch_parameters_cannot_escape_their_launch() {
+        let sibling = "native scale for metal from \"scale.metal\":\n    launch small:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let scratch = "native scale for metal from \"scale.metal\":\n    scratch temporary bytes (ROWS * 4)\n    launch small:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        for declaration in [sibling, scratch] {
+            let error = check_source(source(declaration)).expect_err("launch scope is local");
+            assert!(error.to_string().contains("references `ROWS`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn where_conjuncts_keep_launch_ownership() {
+        let source_text = |condition: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    where {condition}\n    launch small:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large:\n        params (TILE in [4, 8] default 4)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module = crate::native_source::check_fixture(source(&source_text("ROWS == 1 and TILE >= 4")), &[]).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        assert_eq!(configurations.len(), 2);
+        let error =
+            crate::native_source::check_fixture(source(&source_text("ROWS < TILE")), &[]).expect_err("cross-launch conjunct");
+        assert!(error.to_string().contains("only one launch"), "{error}");
+    }
+
+    /// A conjunct that pins a launch's parameters outside its form rejects
+    /// whole prefixes of the walk; the configurations and their order are
+    /// those of filtering the full product.
+    #[test]
+    fn rejected_prefixes_leave_the_admissible_configurations_unchanged() {
+        let text = "native scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1] default 0)\n    where (WIDE == 1 or TILE == 4) and (WIDE == 0 or ROWS == 1)\n    launch small when WIDE == 0:\n        params (ROWS in [1, 2, 4] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when WIDE == 1:\n        params (TILE in [4, 8] default 4)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let module = crate::native_source::check_fixture(source(text), &[]).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        let values = configurations
+            .iter()
+            .map(|configuration| {
+                (
+                    configuration.param("WIDE").unwrap(),
+                    configuration.launch_param(0, "ROWS").unwrap(),
+                    configuration.launch_param(1, "TILE").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [(0, 1, 4), (0, 2, 4), (0, 4, 4), (1, 1, 4), (1, 1, 8)]
+        );
+        for configuration in &configurations {
+            native.validate(configuration).unwrap();
+        }
+    }
+
+    /// A form only some statics admit is found by the search that takes its
+    /// value: the first statics, in candidate order, at which a configuration
+    /// holds it, where the plain search stops at the first admitted statics.
+    #[test]
+    fn a_form_is_searched_at_the_statics_that_admit_it() {
+        let declaration = |condition: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form WIDE in [0, 1] default 0, ROWS in [8, 4] default 8)\n    where N >= 2 and {condition}\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module = check_source(source(&declaration(
+            "(WIDE == 0 or (N == 96 and ROWS == 4))",
+        )))
+        .unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let first = native.search_statics(&[]).unwrap().unwrap();
+        assert_eq!(first.static_value("N"), Some(2));
+        let narrow = native.search_form(None, "WIDE", 0).unwrap().unwrap();
+        assert_eq!(
+            (narrow.static_value("N"), narrow.param("ROWS")),
+            (Some(2), Some(8))
+        );
+        let wide = native.search_form(None, "WIDE", 1).unwrap().unwrap();
+        assert_eq!(wide.static_value("N"), Some(96));
+        assert_eq!((wide.param("WIDE"), wide.param("ROWS")), (Some(1), Some(4)));
+        assert!(native.validate(&wide).is_ok());
+        assert!(native.search_form(None, "WIDE", 2).unwrap().is_none());
+
+        let module = check_source(source(&declaration("(WIDE == 0 or N < 1)"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(native.search_form(None, "WIDE", 1).unwrap().is_none());
+    }
+
+    /// A form value that constrains the statics only through another
+    /// parameter it implies is searched under that implication: the statics
+    /// it refutes are never walked, and a value no configuration holds is
+    /// refuted before any statics are.
+    #[test]
+    fn a_form_is_searched_under_the_parameters_it_implies() {
+        let declaration = |condition: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form RESIDUE in [1, 2] default 1, form PACK in [0, 1] default 0, ROWS in [8, 4] default 8)\n    where N >= 2 and (RESIDUE == 1 or PACK == 1) and (PACK == 0 or ({condition}))\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module = check_source(source(&declaration("N % 256 == 0 and ROWS == 4"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let packed = native.search_form(None, "RESIDUE", 2).unwrap().unwrap();
+        assert_eq!(packed.static_value("N"), Some(256));
+        assert_eq!(
+            (packed.param("PACK"), packed.param("ROWS")),
+            (Some(1), Some(4))
+        );
+        let module = check_source(source(&declaration("N < 1"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(native.search_form(None, "RESIDUE", 2).unwrap().is_none());
+    }
+
+    /// Over ranges of the names it reads, a condition is decided only where
+    /// every assignment within them decides it alike, and is fallible where
+    /// some assignment may not evaluate.
+    #[test]
+    fn a_condition_is_bounded_over_ranges() {
+        use NativeNatExpr::{Constant, Dimension, Parameter, Sub};
+        let product = || {
+            NativeNatExpr::Mul(
+                Box::new(Parameter("ROWS".into())),
+                Box::new(Dimension("N".into())),
+            )
+        };
+        let at_most = |left: NativeNatExpr, right: NativeNatExpr| NativeCondition::Compare {
+            comparison: NativeComparison::Le,
+            left,
+            right,
+        };
+        let bounded = |condition: &NativeCondition, n: u64| {
+            condition.bounded(&|name| (name == "N").then_some((n, n)), &|name| {
+                (name == "ROWS").then_some((4, 8))
+            })
+        };
+        let fits = at_most(product(), Constant(64));
+        assert_eq!(bounded(&fits, 8), NativeBounded::Always(true));
+        assert_eq!(bounded(&fits, 10), NativeBounded::Infallible);
+        assert_eq!(bounded(&fits, 32), NativeBounded::Always(false));
+        let under = at_most(
+            Sub(Box::new(Constant(6)), Box::new(Parameter("ROWS".into()))),
+            Constant(1),
+        );
+        assert_eq!(bounded(&under, 0), NativeBounded::Fallible);
+        // `and` reads its right side only when the left does not decide.
+        let guarded =
+            NativeCondition::And(Box::new(at_most(product(), Constant(16))), Box::new(under));
+        assert_eq!(bounded(&guarded, 8), NativeBounded::Always(false));
+    }
+
+    /// A fixed static that no configuration admits refutes the search before
+    /// the statics declared ahead of it are enumerated, through a conjunct
+    /// false under every parameter value and one static the conjunct reads.
+    #[test]
+    fn a_search_refutes_a_fixed_static_through_its_conjuncts() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "ops.seismic".to_owned(),
+            text: "fn scale[A, B, N](x: &tensor[A] f32, y: &tensor[B] f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[0] * y[0]\n\nnative scale for metal from \"scale.metal\":\n    static (A, B, N)\n    params (ROWS in [8, 4] default 8)\n    where A == B and N == B and N * ROWS >= 16\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".to_owned(),
+        });
+        let module = check_source(sources).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let found = |fixed: &[(&str, u64)]| {
+            native.search_statics(fixed).unwrap().map(|statics| {
+                (
+                    statics.static_value("A"),
+                    statics.static_value("B"),
+                    statics.static_value("N"),
+                )
+            })
+        };
+        assert_eq!(found(&[]), Some((Some(2), Some(2), Some(2))));
+        assert_eq!(found(&[("N", 1)]), None);
+        assert_eq!(found(&[("N", 0)]), None);
+        assert_eq!(found(&[("A", 64)]), Some((Some(64), Some(64), Some(64))));
+    }
+
+    /// Narrowing drops a parameter value every configuration holding it
+    /// violates, then the values that relied on it.
+    #[test]
+    fn narrowing_drops_values_no_configuration_admits() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (WIDE in [0, 1] default 0, ROWS in [8, 4] default 8)\n    where (WIDE == 0 or N >= 8) and (ROWS == 8 or WIDE == 1)\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let domains = |n: u64| {
+            native
+                .narrowed(&NativeSpecialization::new().with_static("N", n))
+                .map(|narrowed| {
+                    narrowed
+                        .params
+                        .iter()
+                        .map(|parameter| parameter.values.clone())
+                        .collect::<Vec<_>>()
+                })
+        };
+        assert_eq!(domains(2), Some(vec![vec![0], vec![8]]));
+        assert_eq!(domains(8), Some(vec![vec![0, 1], vec![8, 4]]));
+    }
+
+    /// A partial assignment decides a condition when an operand it can
+    /// evaluate settles the result, whichever side that operand is on.
+    #[test]
+    fn a_condition_is_decided_by_the_operands_it_can_evaluate() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form WIDE in [0, 1] default 0)\n    where (WIDE == 0 or N == 96) and (N <= 512 or WIDE == 1)\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let mut conjuncts = Vec::new();
+        native
+            .constraint
+            .as_ref()
+            .unwrap()
+            .conjuncts(&mut conjuncts);
+        let none = |_: &str| None;
+        let wide = |name: &str| (name == "WIDE").then_some(1);
+        let at = |n: u64| move |name: &str| (name == "N").then_some(n);
+        assert_eq!(conjuncts[0].decided(&at(96), &none), Some(true));
+        assert_eq!(conjuncts[0].decided(&at(32), &none), None);
+        assert_eq!(conjuncts[0].decided(&at(32), &wide), Some(false));
+        assert!(conjuncts[0].holds(&at(96), &none).is_err());
+        assert_eq!(conjuncts[1].decided(&none, &wide), Some(true));
+        assert_eq!(conjuncts[1].decided(&none, &none), None);
+    }
+
+    /// A row tile of WARPS * 16 / N tokens, admitted only where it holds a
+    /// token (`where N <= WARPS * 16`), as CUDA's prefill sizes its tiles,
+    /// and a buffer only the widest configurations charge.
+    fn tiled(constraint: &str) -> NativeImplementation {
+        let module = check_source(source(&format!(
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic WARPS in [4, 2, 8, 1] default 4)\n    where {constraint}\n    scratch tiles bytes (ceil_div(N, WARPS * 16 / N) * 4)\n    scratch wide bytes (N * WARPS) when WARPS > 4\n    launch scale:\n        threadgroups (ceil_div(N, WARPS * 16 / N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+        )))
+        .expect("tiled declaration checks");
+        module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn scratch_bound_sizes_only_admitted_configurations() {
+        let at = |n: u64| move |name: &str| (name == "N").then_some(n);
+        // At N = 64, WARPS 2 and 1 are refused, and their tiles would divide
+        // by zero; WARPS 4 holds 1 token a tile, 8 holds 2 and alone charges
+        // the guarded buffer.
+        let native = tiled("N <= WARPS * 16");
+        assert_eq!(native.scratch_bound(&at(64)), Ok(vec![256, 512]));
+        // At N = 16 every WARPS is admitted.
+        assert_eq!(native.scratch_bound(&at(16)), Ok(vec![64, 128]));
+        assert_eq!(
+            native.scratch_bound(&at(1024)),
+            Err(NativeScratchBoundError::Specialization(NativeSpecializationError::Inadmissible))
+        );
+        assert_eq!(
+            native.scratch_bound(&|_| None),
+            Err(NativeScratchBoundError::Specialization(NativeSpecializationError::MissingStatic(
+                "N".into()
+            )))
+        );
+    }
+
+    /// Each buffer's largest charge over every configuration of the full
+    /// product of the domains that [`NativeImplementation::validate`]
+    /// admits, `None` where it admits none: the bound by definition.
+    fn brute_scratch_bound(native: &NativeImplementation, n: u64) -> Option<Vec<u64>> {
+        let domains = native
+            .params
+            .iter()
+            .map(|parameter| (None, parameter))
+            .chain(native.launches.iter().enumerate().flat_map(|(launch, declaration)| {
+                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
+            }))
+            .collect::<Vec<_>>();
+        let dimension = |name: &str| (name == "N").then_some(n);
+        let mut bound: Option<Vec<u64>> = None;
+        let mut steps = vec![0usize; domains.len()];
+        loop {
+            let configuration = domains.iter().zip(&steps).fold(
+                NativeSpecialization::new().with_static("N", n),
+                |configuration, ((launch, parameter), &step)| match launch {
+                    None => configuration.with_param(parameter.name.clone(), parameter.values[step]),
+                    Some(launch) => configuration.with_launch_param(
+                        *launch,
+                        parameter.name.clone(),
+                        parameter.values[step],
+                    ),
+                },
+            );
+            if native.validate(&configuration).is_ok() {
+                let charges = native.scratch.iter().map(|buffer| {
+                    buffer
+                        .charge(&dimension, &|name| configuration.param(name))
+                        .expect("an admitted configuration is sized")
+                });
+                bound = Some(match bound {
+                    None => charges.collect(),
+                    Some(bound) => bound.iter().zip(charges).map(|(a, b)| (*a).max(b)).collect(),
+                });
+            }
+            let Some(position) =
+                (0..domains.len()).rev().find(|&position| steps[position] + 1 < domains[position].1.values.len())
+            else {
+                return bound;
+            };
+            steps[position] += 1;
+            steps[position + 1..].fill(0);
+        }
+    }
+
+    #[test]
+    fn scratch_bound_equals_the_maximum_over_every_admitted_configuration() {
+        // STAGES leads the declaration and no buffer reads it; the launch's
+        // LANES and ROWS are refused by `where` alongside the entry's. WARPS
+        // 1 and 2 at N = 64 are refused, and their tiles divide by zero.
+        let module = crate::native_source::check_fixture(source(
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic STAGES in [1, 2] default 1, arithmetic WARPS in [4, 2, 8, 1] default 4, arithmetic SPLIT in [1, 2, 4] default 1, form PACK in [0, 1] default 0)\n    where N <= WARPS * 16 and (PACK == 0 or LANES == 8) and (SPLIT == 1 or ROWS == 2) and (STAGES == 1 or PACK == 1) and (SPLIT < 4 or WARPS < 8 or LANES == 32)\n    scratch tiles bytes (ceil_div(N, WARPS * 16 / N) * 4)\n    scratch wide bytes (N * WARPS * SPLIT) when WARPS > 4 and PACK == 0\n    scratch packed bytes (N * SPLIT * 3) when PACK == 1\n    launch scale:\n        params (LANES in [16, 8, 32] default 16, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, WARPS * 16 / N) * LANES, ROWS, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ), &[])
+        .expect("scaled declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        for n in [1, 16, 32, 48, 64, 96, 128, 1024] {
+            let at = |name: &str| (name == "N").then_some(n);
+            match brute_scratch_bound(native, n) {
+                Some(bound) => assert_eq!(native.scratch_bound(&at), Ok(bound), "N = {n}"),
+                None => assert_eq!(
+                    native.scratch_bound(&at),
+                    Err(NativeScratchBoundError::Specialization(
+                        NativeSpecializationError::Inadmissible
+                    )),
+                    "N = {n}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_bound_refuses_an_admitted_configuration_it_cannot_size() {
+        // A `where` that admits WARPS 2 at N = 64, whose tile holds no token.
+        let native = tiled("N <= WARPS * 64");
+        assert_eq!(
+            native.scratch_bound(&|name: &str| (name == "N").then_some(64)),
+            Err(NativeScratchBoundError::Charge {
+                scratch: "tiles".into(),
+                params: [("WARPS".to_owned(), 2)].into_iter().collect(),
+                error: NativeEvalError::Arithmetic,
+            })
+        );
+    }
+
+    #[test]
+    fn native_domain_enumerates_admissible_configurations() {
+        let module = check_source(source(SPECIALIZED)).expect("specialized declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        let statics = NativeSpecialization::new().with_static("N", 256);
+        let admissible = native.admissible(&statics).expect("statics are complete");
+        // PARTS * WIDTH <= 256 admits (1,64) (1,128) (2,64) (2,128) (4,64).
+        assert_eq!(admissible.len(), 5);
+        assert!(
+            admissible
+                .iter()
+                .all(|configuration| configuration.static_value("N") == Some(256))
+        );
+        let default = native.device_independent().unwrap().default_specialization(&statics).unwrap();
+        assert_eq!(default.param("PARTS"), Some(1));
+        assert_eq!(default.param("WIDTH"), Some(64));
+        let small = NativeSpecialization::new().with_static("N", 32);
+        assert!(matches!(
+            native.device_independent().unwrap().default_specialization(&small),
+            Err(NativeSpecializationError::Inadmissible)
+        ));
+        assert!(native.admissible(&small).unwrap().is_empty());
+        assert!(matches!(
+            native.validate(&default.clone().with_param("WIDTH", 96)),
+            Err(NativeSpecializationError::OutsideDomain { .. })
+        ));
+        assert!(matches!(
+            native.admissible(&NativeSpecialization::new()),
+            Err(NativeSpecializationError::MissingStatic(_))
+        ));
+    }
+
+    /// A default is a listed value, the least or the greatest at which its
+    /// condition holds over the statics; a launch's `where` is one more
+    /// conjunct of the declaration's.
+    #[test]
+    fn defaults_are_declared_and_the_walk_starts_from_them() {
+        let module = crate::native_source::check_fixture(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (WIDTH in [64, 128, 256] default least where WIDTH * 4 >= N, ROWS in [1, 2, 4] default 2)\n    launch scale:\n        params (LANES in [8, 16, 32] default greatest where LANES <= 16)\n        where ROWS * LANES <= 32\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (LANES, 1, 1)\n",
+        ), &[])
+        .expect("declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let at = |n| NativeSpecialization::new().with_static("N", n);
+        let small = native.device_independent().unwrap().default_specialization(&at(300)).unwrap();
+        assert_eq!(
+            (small.param("WIDTH"), small.param("ROWS"), small.launch_param(0, "LANES")),
+            (Some(128), Some(2), Some(16))
+        );
+        // No width reaches N: the default has no value.
+        assert!(matches!(
+            native.device_independent().unwrap().default_specialization(&at(4096)),
+            Err(NativeSpecializationError::Default { .. })
+        ));
+        // The launch's `where` is one of the declaration's conjuncts.
+        assert!(native
+            .admissible(&at(300))
+            .unwrap()
+            .iter()
+            .all(|configuration| configuration.param("ROWS").unwrap()
+                * configuration.launch_param(0, "LANES").unwrap()
+                <= 32));
+    }
+
+    #[test]
+    fn defaults_must_name_a_listed_value_over_the_device_and_statics() {
+        let launch = "    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let cases = [
+            ("    params (ROWS in [1, 2])\n", "expected `default`"),
+            ("    params (ROWS in [1, 2] default 3)\n", "is not a listed value"),
+            ("    params (ROWS in [1, 2] default N)\n", "is not static"),
+            ("    params (ROWS in [1, 2] default least where ROWS > 4)\n", "no listed value satisfies"),
+            ("    params (ROWS in [1, 2] default device.no_such_property)\n", "is not a property `metal` provides"),
+        ];
+        for (params, expected) in cases {
+            let declaration = format!("native scale for metal from \"scale.metal\":\n{params}{launch}");
+            let error = check_source(source(&declaration)).expect_err(expected).to_string();
+            assert!(error.contains(expected), "expected {expected:?}, got {error}");
+        }
+        let measured = format!(
+            "native scale for vulkan from \"vulkan/scale.comp\":\n    params (ROWS in [1, 2] default least where ROWS * 128 <= device.registers_per_group)\n{launch}"
+        );
+        let error = check_source(source(&measured)).expect_err("a measured property").to_string();
+        assert!(error.contains("`device.registers_per_group` is measured"), "{error}");
+    }
+
+    /// A default that reads the device but no dimension and no element is
+    /// checked as the module is checked, on every device of its backend:
+    /// at both values of each capability it reads, and over every whole
+    /// number of each count.
+    #[test]
+    fn device_defaults_are_checked_on_every_device() {
+        let declaration = |params: &str| {
+            format!(
+                "native scale for vulkan from \"vulkan/scale.comp\":\n    params ({params})\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        for params in [
+            "ROWS in [1, 2] default 1 + device.matrix",
+            "ROWS in [1, 2] default 2 - device.float16 * device.matrix",
+            "ROWS in [1, 2, 4] default least where ROWS * 32 >= device.subgroup_width or ROWS == 4",
+            "LANES in [16, 32] default greatest where LANES <= device.subgroup_width or LANES == 16",
+            "ROWS in [1, 2, 4] default min(device.subgroup_width, 4) / 4 + 1",
+        ] {
+            check_source(source(&declaration(params)))
+                .unwrap_or_else(|error| panic!("{params}: {error}"));
+        }
+        for (params, expected) in [
+            (
+                "ROWS in [1, 2] default 2 + device.matrix",
+                "on a device where device.matrix = 1: its value 3 is not a listed value",
+            ),
+            (
+                "ROWS in [1, 2] default 1 + device.float16 + device.matrix",
+                "on a device where device.float16 = 1, device.matrix = 1: its value 3",
+            ),
+            ("LANES in [16, 32] default device.subgroup_width", "on some device it may be 0"),
+            ("ROWS in [1, 2] default device.subgroup_width * 2", "may fail to evaluate on some device"),
+            (
+                "ROWS in [1, 2, 4] default least where ROWS * 32 >= device.subgroup_width",
+                "no listed value satisfies its condition on every device",
+            ),
+            (
+                "ROWS in [1, 2] default least where 64 / (ROWS - 1) >= device.subgroup_width or ROWS == 2",
+                "its condition may fail to evaluate on some device at 1",
+            ),
+        ] {
+            let error = check_source(source(&declaration(params))).expect_err(params).to_string();
+            assert!(error.contains(expected), "{params}: expected {expected:?}, got {error}");
+        }
+    }
+
+    /// The declared defaults are only the first candidate: at statics where
+    /// they violate `where` but another configuration satisfies it, the
+    /// default is the first admissible configuration of the walk in which
+    /// each parameter tries its default before its other values.
+    #[test]
+    fn default_is_the_first_admissible_configuration() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (ROWS in [2, 1, 4] default 2, LANES in [16, 32] default 16)\n    where ceil_div(N, 32 * LANES) * ROWS <= 8\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .expect("declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let at = |n| NativeSpecialization::new().with_static("N", n);
+        let narrow = native.device_independent().unwrap().default_specialization(&at(512)).unwrap();
+        assert_eq!(
+            (narrow.param("ROWS"), narrow.param("LANES")),
+            (Some(2), Some(16))
+        );
+        // At N = 4096, ROWS = 2 with LANES = 16 needs 16 packets; ROWS = 2
+        // with LANES = 32 needs 8.
+        let wide = native.device_independent().unwrap().default_specialization(&at(4096)).unwrap();
+        assert_eq!(
+            (wide.param("ROWS"), wide.param("LANES")),
+            (Some(2), Some(32))
+        );
+        assert_eq!(Some(&wide), native.admissible(&at(4096)).unwrap().first());
+        assert!(matches!(
+            native.device_independent().unwrap().default_specialization(&at(65_536)),
+            Err(NativeSpecializationError::Inadmissible)
+        ));
+    }
+
+    #[test]
+    fn conditions_gate_launches_and_scratch_and_restrict_configurations() {
+        let module = check_source(source(
+            "native scale for cuda from \"scale.cu\":\n    params (PARTS in [1, 2, 4] default 1)\n    where PARTS == 1 or (PARTS >= 2 and PARTS < 4)\n    scratch partials bytes (PARTS * N * 4) when PARTS > 1 and N > 256\n    launch scale_small when N <= 256:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (N, 1, 1)\n    launch scale_large when N > 256 or PARTS > 1:\n        threadgroups (ceil_div(N, 256), PARTS, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch scale_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+        ))
+        .expect("`when` may read a dimension that is not static");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        // `where` gained `or`: PARTS 4 is outside it.
+        let admissible = native.admissible(&NativeSpecialization::new()).unwrap();
+        assert_eq!(
+            admissible
+                .iter()
+                .map(|configuration| configuration.param("PARTS").unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let at = |n: u64, parts: u64| {
+            move |condition: &NativeCondition| {
+                condition
+                    .holds(&|name| (name == "N").then_some(n), &|name| {
+                        (name == "PARTS").then_some(parts)
+                    })
+                    .unwrap()
+            }
+        };
+        let small = native.launches[0].when.as_ref().unwrap();
+        let large = native.launches[1].when.as_ref().unwrap();
+        let partials = native.scratch[0].when.as_ref().unwrap();
+        assert!(native.launches[2].when.is_none());
+        assert!(at(64, 1)(small) && !at(64, 1)(large) && !at(64, 1)(partials));
+        assert!(!at(1024, 1)(small) && at(1024, 1)(large) && !at(1024, 1)(partials));
+        assert!(at(64, 2)(small) && at(64, 2)(large) && !at(64, 2)(partials));
+        assert!(at(1024, 2)(partials));
+        let mut read = Vec::new();
+        large.dimensions(&mut read);
+        assert_eq!(read, ["N"]);
+        // `and` and `or` evaluate their right side only when needed.
+        let unbound = NativeCondition::Compare {
+            comparison: NativeComparison::Eq,
+            left: NativeNatExpr::Dimension("Z".into()),
+            right: NativeNatExpr::Constant(0),
+        };
+        let never = NativeCondition::Compare {
+            comparison: NativeComparison::Lt,
+            left: NativeNatExpr::Constant(1),
+            right: NativeNatExpr::Constant(0),
+        };
+        let none = |_: &str| None;
+        assert_eq!(
+            NativeCondition::And(Box::new(never.clone()), Box::new(unbound.clone()))
+                .holds(&none, &none),
+            Ok(false)
+        );
+        assert_eq!(
+            NativeCondition::Or(Box::new(never), Box::new(unbound)).holds(&none, &none),
+            Err(NativeEvalError::Unbound("Z".into()))
+        );
+    }
+
+    #[test]
+    fn vulkan_launch_geometry_reads_only_static_dimensions_and_parameters() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "rows.seismic".to_owned(),
+            text: "fn rows[M, N](x: &tensor[M, N] f32) -> tensor[M] f32:\n    let mut output = tensor[M] f32\n    for i in 0..M:\n        output[i] = x[i, 0]\n    return output\n\nnative rows for vulkan from \"vulkan/rows.comp\":\n    static (N)\n    params (WIDTH in [64, 128] default 64)\n    scratch partials bytes (M * 4) when M > 1\n    launch rows when M > 0:\n        threadgroups (ceil_div(M, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (min(N, 8) * WIDTH * 4)\n".to_owned(),
+        }]))
+        .expect("group counts, `when` and scratch may read per-call dimensions");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Vulkan)
+            .expect("vulkan implementation");
+        assert_eq!(native.backend.as_str(), "vulkan");
+        for (property, expected) in [
+            (
+                "threads_per_threadgroup (M, 1, 1)",
+                "`M` is only known per call",
+            ),
+            (
+                "threads_per_threadgroup (64, 1, 1)\n        shared_bytes (min(M, 8) * 72)",
+                "`M` is only known per call",
+            ),
+        ] {
+            let error = check_source(SourceSet::new(vec![SourceFile {
+                path: "rows.seismic".to_owned(),
+                text: format!("fn rows[M, N](x: &tensor[M, N] f32) -> tensor[M] f32:\n    let mut output = tensor[M] f32\n    for i in 0..M:\n        output[i] = x[i, 0]\n    return output\n\nnative rows for vulkan from \"vulkan/rows.comp\":\n    static (N)\n    launch rows:\n        threadgroups (1, 1, 1)\n        {property}\n"),
+            }]))
+            .expect_err("per-call launch geometry is rejected on Vulkan");
+            let text = error.to_string();
+            assert!(
+                text.contains(expected) && text.contains("Vulkan fixes the group size"),
+                "{text}"
+            );
+        }
+        // The same declaration is admitted for CUDA, where geometry is per launch.
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "rows.seismic".to_owned(),
+            text: "fn rows[M, N](x: &tensor[M, N] f32) -> tensor[M] f32:\n    let mut output = tensor[M] f32\n    for i in 0..M:\n        output[i] = x[i, 0]\n    return output\n\nnative rows for cuda from \"cuda/rows.cu\":\n    launch rows:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (M, 1, 1)\n        shared_bytes (min(M, 8) * 72)\n".to_owned(),
+        }]))
+        .expect("CUDA launch geometry may read per-call dimensions");
+    }
+
+    #[test]
+    fn lowerings_are_rejected_for_the_native_only_vulkan_backend() {
+        let source = |target: &str| {
+            SourceSet::new(vec![SourceFile {
+                path: "copy.seismic".to_owned(),
+                text: format!(
+                    "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nlower copy[N](x: &tensor[N] f32) -> tensor[N] f32\n    for {target}:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n"
+                ),
+            }])
+        };
+        check_source(source("cpu")).expect("a lowering for a compiler target is admitted");
+        let text = check_source(source("vulkan"))
+            .expect_err("vulkan has no compiler target")
+            .to_string();
+        assert!(
+            text.contains("`vulkan` runs only native implementations"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_native_implementations_are_rejected() {
+        let declaration = "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let error = check_source(source(&format!("{declaration}\n{declaration}")))
+            .expect_err("duplicate implementation must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("already has a native implementation")
+        );
+    }
+
+    /// `unit_columns(U)` has a value only where `U` is a conversion's packed
+    /// destination: at a dense destination, the element cast `repack` forms
+    /// between dense floats, an implementation reading it does not form,
+    /// and says so rather than panicking.
+    #[test]
+    fn an_implementation_reading_unit_columns_forms_only_at_packed_destinations() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "convert.seismic".to_owned(),
+            text: "fn convert[N, K](source: &tensor[N, K] E) -> tensor[N, K] U:\n    return repack[U = U](source)\n\nnative convert for cuda from \"convert.cu\":\n    launch convert:\n        threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), N, 1)\n        threads_per_threadgroup (32, 1, 1)\n".to_owned(),
+        });
+        let module = check_source(sources).expect("`unit_columns` reads a conversion destination");
+        let entry = module.entry_named("convert").unwrap();
+        let native = module.native_implementation(entry, BackendName::Cuda).unwrap();
+        let at = |source: RepresentationId, destination: RepresentationId| {
+            let bindings = ElementBindings::new().bind("E", source).bind("U", destination);
+            (
+                module
+                    .native_implementation_at(entry, BackendName::Cuda, &bindings)
+                    .is_some(),
+                native.at_elements(&bindings).is_some(),
+            )
+        };
+        let packed = registry::storage("q4k", registry::Layout::Mma16).unwrap();
+        assert_eq!(at(registry::representation("gguf_q4_k").unwrap(), packed), (true, true));
+        assert_eq!(
+            at(registry::dense(DType::F16), registry::dense(DType::F32)),
+            (false, false)
+        );
+    }
+
+    /// `form(W, NAME)` is the backend's admission of form NAME for the
+    /// representation `W` is bound to, and `where` may read it: the
+    /// configurations are the implementation's at its bindings, and the
+    /// declaration's own are `Unbound`. A name the backend has no form of is
+    /// a declaration error.
+    #[test]
+    fn where_reads_the_forms_of_the_bound_elements() {
+        let check = |native: &str| {
+            let mut sources = SourceSet::default();
+            sources.push(SourceFile {
+                path: "ops.seismic".to_owned(),
+                text: format!(
+                    "fn copy[N](src: &tensor[N] A, dst: &mut tensor[N] A, w: &tensor[N] W):\n    dst[0:N] = src[0:N]\n\n{native}"
+                ),
+            });
+            check_source(sources)
+        };
+        let declaration = |form: &str| {
+            format!(
+                "native copy for cuda from \"copy.cu\":\n    params (INT8 in [0, 1] default 0)\n    where INT8 == 0 or form(W, {form}) == 1\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module = check(&declaration("INT8")).expect("`where` reads a CUDA form");
+        let entry = module.entry_named("copy").unwrap();
+        let native = module.native_implementation(entry, BackendName::Cuda).unwrap();
+        let statics = NativeSpecialization::new();
+        assert_eq!(
+            native.device_independent().unwrap().default_specialization(&statics),
+            Err(NativeSpecializationError::Unbound("form(W, INT8)".to_owned()))
+        );
+        assert!(matches!(
+            native.search_statics(&[]),
+            Err(NativeSpecializationError::Unbound(_))
+        ));
+        let int8 = |weight: RepresentationId| {
+            let storage = registry::representation_info(weight).name;
+            let bindings = ElementBindings::new()
+                .bind("A", registry::dense(DType::F32))
+                .bind("W", weight);
+            let bound = module
+                .native_implementation_at(entry, BackendName::Cuda, &bindings)
+                .unwrap();
+            assert_eq!(Some(bound), native.at_elements(&bindings).as_ref(), "{storage}");
+            bound
+                .admissible(&statics)
+                .unwrap()
+                .iter()
+                .map(|configuration| configuration.param("INT8").unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mma16 = |storage| registry::storage(storage, registry::Layout::Mma16).unwrap();
+        assert_eq!(int8(mma16("q4k")), [0, 1]);
+        assert_eq!(int8(mma16("nvfp4g16a4")), [0]);
+        assert_eq!(int8(registry::dense(DType::BF16)), [0]);
+        for (form, message) in [
+            ("INT9", "`INT9` is not a form of `cuda`; its forms are GEMM_FOLD, INT8, GEMV_RECORDS, INT8_LOCAL, INT8_LOCAL_NEGATED"),
+            ("PACK", "`PACK` is not a form of `cuda`"),
+        ] {
+            let error = check(&declaration(form)).expect_err("a misspelled form fails checking");
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        let error = check(&declaration("INT8").replace("form(W,", "form(N,"))
+            .expect_err("a form reads an element parameter");
+        assert!(error.to_string().contains("`form` reads one of the entry's element parameters"), "{error}");
+    }
+
+    /// `elements` lists the dense types a CPU form compiles a stored element
+    /// parameter for, and is rejected anywhere else.
+    #[test]
+    fn cpu_element_coverage_names_stored_element_parameters() {
+        let check = |native: &str| {
+            let mut sources = SourceSet::default();
+            sources.push(SourceFile {
+                path: "ops.seismic".to_owned(),
+                text: format!(
+                    "fn copy[N](src: &tensor[N] A, dst: &mut tensor[N] A, w: &tensor[N] W):\n    dst[0:N] = src[0:N]\n\nfn widen[N](w: &tensor[N] W) -> tensor[N] U:\n    return repack[U = U](w)\n\n{native}"
+                ),
+            });
+            check_source(sources)
+        };
+        let launch = "    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let module = check(&format!(
+            "native copy for cpu from \"copy.rs\":\n    elements (A in [f32, u32, i32])\n{launch}"
+        ))
+        .expect("CPU element coverage checks");
+        let native = module
+            .native_implementation(module.entry_named("copy").unwrap(), BackendName::Cpu)
+            .expect("cpu native implementation");
+        assert_eq!(
+            native.elements,
+            [NativeElementCoverage {
+                parameter: "A".to_owned(),
+                dtypes: vec![DType::F32, DType::U32, DType::I32]
+            }]
+        );
+        let widen = "    launch widen:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for (native, message) in [
+            (
+                format!(
+                    "native copy for metal from \"copy.metal\":\n    elements (A in [f32])\n{launch}"
+                ),
+                "other backends compile each binding",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (B in [f32])\n{launch}"
+                ),
+                "`B` is not an element parameter",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (W in [f32])\n{launch}"
+                ),
+                "`W` is not stored",
+            ),
+            (
+                format!(
+                    "native widen for cpu from \"widen.rs\":\n    elements (U in [f32])\n{widen}"
+                ),
+                "`U` is not stored",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (A in [f32, f32])\n{launch}"
+                ),
+                "`f32` is listed twice",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (A in [bool])\n{launch}"
+                ),
+                "`bool` is not a CPU element type",
+            ),
+            (
+                format!(
+                    "native copy for cpu from \"copy.rs\":\n    elements (A in [f32], A in [u32])\n{launch}"
+                ),
+                "declared twice",
+            ),
+        ] {
+            let error = check(&native).expect_err(message).to_string();
+            assert!(error.contains(message), "{message}: {error}");
+        }
+    }
+
+    #[test]
+    fn native_implementation_rejects_unknown_contract_facts() {
+        let launch = "    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let cases = [
+            (
+                format!("native missing for metal from \"scale.metal\":\n{launch}"),
+                "unknown portable function `missing`",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(M, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n".to_owned(),
+                "references `M`, which is neither a dimension, a native parameter nor a constant",
+            ),
+            (
+                format!("native scale for tpu from \"scale.c\":\n{launch}"),
+                "unknown native backend `tpu`",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    static (K)\n{launch}"),
+                "`K` is not a shape dimension of `scale`",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (N in [1] default 1)\n{launch}"),
+                "native parameter `N` shadows a dimension",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1, 1] default 1)\n{launch}"),
+                "lists 1 twice",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1] default 1)\n    where P <= N\n{launch}"),
+                "reads dimension `N`, which is not static",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1] default 1)\n    where P + 1\n{launch}"),
+                "a native `where` condition is a comparison",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    params (P in [1] default 1)\n    where P == 1 or P < N\n{launch}"),
+                "reads dimension `N`, which is not static",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when N:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when N + 1:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when N > 1 and (N < 8 or N):\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    launch scale when M > 1:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
+                "references `M`, which is neither a dimension, a native parameter nor a constant",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when N\n{launch}"),
+                "a native `when` condition is a comparison",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when Q >= 2\n{launch}"),
+                "references `Q`, which is neither a dimension, a native parameter nor a constant",
+            ),
+            (
+                "native scale for metal from \"scale.metal\":\n    static (N)\n".to_owned(),
+                "expected `launch <kernel>:`",
+            ),
+        ];
+
+        for (declaration, expected) in cases {
+            let error = check_source(source(&declaration))
+                .expect_err("invalid native declaration must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "expected diagnostic containing {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A launch grid is a `&tensor[3] i32` the launch reads, or a 12-byte
+    /// scratch buffer of the implementation, on every backend: any other
+    /// extent, element, access or scratch declaration is refused.
+    #[test]
+    fn a_launch_grid_is_three_words_an_earlier_launch_wrote() {
+        let declaration = |parameter: &str, scratch: &str, grid: &str, backend: &str| {
+            format!(
+                "fn fill[N](grid: {parameter}, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n{scratch}    launch fill:\n        threadgroups (N, 1, 1)\n        grid ({grid})\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        // A CUDA written grid is a block of the launch's source.
+        let check = |text: String| {
+            crate::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: "fill.seismic".to_owned(),
+                    text,
+                }]),
+                &[],
+            )
+        };
+        for (backend, name) in [
+            ("metal", BackendName::Metal),
+            ("cuda", BackendName::Cuda),
+            ("vulkan", BackendName::Vulkan),
+            ("cpu", BackendName::Cpu),
+        ] {
+            for (scratch, grid, expected) in [
+                ("", "grid", LaunchGrid::Parameter("grid".to_owned())),
+                ("    scratch written bytes (12)\n", "written", LaunchGrid::Scratch("written".to_owned())),
+            ] {
+                let module = check(declaration("&tensor[3] i32", scratch, grid, backend)).expect("a three-word grid checks");
+                let native = module
+                    .native_implementation(module.entries()[0].id, name)
+                    .expect("native implementation");
+                assert_eq!(native.launches[0].grid, Some(expected), "{backend}");
+            }
+        }
+        for (parameter, scratch, grid, expected) in [
+            ("&tensor[4] i32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&tensor[N] i32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&tensor[3] u32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&mut tensor[3] i32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&tensor[3] i32", "    scratch written bytes (16)\n", "written", "must be a scratch buffer of `bytes (12)`"),
+            ("&tensor[3] i32", "    scratch written bytes (12) sync\n", "written", "must be a scratch buffer of `bytes (12)`"),
+            ("&tensor[3] i32", "    scratch grid bytes (12)\n", "grid", "names both"),
+            ("&tensor[3] i32", "", "written", "is not an entry parameter or scratch buffer"),
+        ] {
+            let error = check(declaration(parameter, scratch, grid, "metal"))
+                .expect_err("an inadmissible grid must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "{parameter} {scratch:?} {grid}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A resident launch (`launch K resident (BARRIER)`) is declared on a
+    /// backend that runs resident launches, with a one-axis work bound, no
+    /// written grid and a barrier of `sync` scratch of at least
+    /// `RESIDENT_BARRIER_BYTES`; every launch of its kernel is resident.
+    #[test]
+    fn a_resident_launch_names_a_sync_barrier_on_a_backend_that_runs_it() {
+        let declaration = |scratch: &str, launch: &str, backend: &str| {
+            format!(
+                "fn fill[N](grid: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n{scratch}{launch}"
+            )
+        };
+        let resident = |head: &str, groups: &str, grid: &str| {
+            format!("    launch {head}:\n        threadgroups ({groups})\n{grid}        threads_per_threadgroup (32, 1, 1)\n")
+        };
+        let check = |text: String| {
+            crate::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: "fill.seismic".to_owned(),
+                    text,
+                }]),
+                &[],
+            )
+        };
+        let barrier = "    scratch barrier bytes (16) sync\n";
+        let module = check(declaration(barrier, &resident("fill resident (barrier)", "N, 1, 1", ""), "metal"))
+            .expect("a resident launch checks on Metal");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(
+            native.launches[0].resident,
+            Some(ResidentLaunch { barrier: "barrier".to_owned() })
+        );
+        let two = format!(
+            "{}{}",
+            resident("fill resident (barrier)", "N, 1, 1", ""),
+            resident("fill", "N, 1, 1", "")
+        );
+        for (scratch, launch, backend, expected) in [
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", ""), "cuda", "cuda does not"),
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", ""), "vulkan", "vulkan does not"),
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", ""), "cpu", "cpu does not"),
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", "        grid (grid)\n"), "metal", "reads no written grid"),
+            (barrier, resident("fill resident (barrier)", "N, 2, 1", ""), "metal", "has one axis"),
+            ("    scratch barrier bytes (8) sync\n", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "at least `bytes (16)`"),
+            ("    scratch barrier bytes (16)\n", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "at least `bytes (16)`"),
+            ("    scratch barrier bytes (16) sync when N > 1\n", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "without `when`"),
+            ("", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "must be a `sync` scratch buffer"),
+            (barrier, two, "metal", "not all resident or all dispatched"),
+        ] {
+            let error = check(declaration(scratch, &launch, backend))
+                .expect_err("an inadmissible resident launch must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "{backend} {scratch:?} {launch:?}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A record port is a device tensor parameter or tensor result with a
+    /// leading record axis, named once, on a backend that binds record tables
+    /// (`BackendName::binds_record_tables`): anything else is refused.
+    #[test]
+    fn a_record_port_is_a_device_tensor_named_once_where_record_tables_bind() {
+        let declaration = |records: &str, backend: &str| {
+            format!(
+                "fn scale[M, N](x: &tensor[M, N] f32, served: &host tensor[4] i32, factor: f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * factor\n    return result\n\nnative scale for {backend} from \"scale.src\":\n    records ({records})\n    launch scale:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".to_owned(),
+                text,
+            }]))
+        };
+        let module = check(declaration("x, result 0", "metal")).expect("record ports check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(
+            native.records,
+            vec![RecordPort::Parameter("x".to_owned()), RecordPort::Result(0)]
+        );
+        check(declaration("x, result 0", "vulkan")).expect("Vulkan binds record tables");
+        for (records, backend, expected) in [
+            ("x", "cuda", "cuda binds no record tables"),
+            ("x", "cpu", "cpu binds no record tables"),
+            ("served", "metal", "record port `served` must be a device tensor"),
+            ("factor", "metal", "record port `factor` must be a device tensor"),
+            ("y", "metal", "record port `y` is not an entry parameter"),
+            ("result 1", "metal", "record port `result 1` is not an entry result"),
+            ("x, x", "metal", "record port `x` is listed twice"),
+            ("result 0, result 0", "metal", "record port `result 0` is listed twice"),
+        ] {
+            let error = check(declaration(records, backend))
+                .expect_err("an inadmissible record port must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "{records} {backend}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A launch's own `records` replaces its native's for that launch, which
+    /// then forms its own source (`launch_scoped`); launches of one kernel
+    /// list the same record ports.
+    #[test]
+    fn a_launch_lists_its_own_record_ports() {
+        let declaration = |second: &str, kernel: &str| {
+            format!(
+                "fn scale[M, N](x: &tensor[M, N] f32, factor: f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * factor\n    return result\n\nnative scale for metal from \"scale.src\":\n    records (x, result 0)\n    launch scale when M > 1:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n    launch {kernel} when M == 1:\n        {second}\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        // A launch-scoped native's launches take their code parameters from
+        // its source, which the fixture forms.
+        let check = |text: String| {
+            crate::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: "scale.seismic".to_owned(),
+                    text,
+                }]),
+                &[],
+            )
+        };
+        let module = check(declaration("records (result 0)", "scale_one")).expect("a launch's own record ports check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(native.launch_records(0), [RecordPort::Parameter("x".to_owned()), RecordPort::Result(0)]);
+        assert_eq!(native.launch_records(1), [RecordPort::Result(0)]);
+        assert!(native.launch_scoped(), "launches of different record ports form their own sources");
+        let error = check(declaration("records (result 0)", "scale"))
+            .expect_err("launches of one kernel must list the same record ports");
+        assert!(error.to_string().contains("launches of kernel `scale` list different record ports"), "{error}");
+    }
+
+    /// A launch condition is one `i32` word the host writes, on a backend
+    /// that encodes each run's launches (`BackendName::encodes_runs`): word
+    /// 0 of a `&tensor[1] i32` (`(w)`), or word INDEX of a `&tensor[N] i32`
+    /// (`(w[INDEX])`, INDEX a constant below N). Any other element, rank,
+    /// access, index past the extent, or backend, is refused.
+    #[test]
+    fn a_launch_condition_is_one_word_a_run_encoding_backend_reads() {
+        let declaration = |clause: &str, word: &str, parameter: &str, backend: &str| {
+            format!(
+                "fn fill[N](whole: {parameter}, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n    launch fill:\n        threadgroups (N, 1, 1)\n        {clause} ({word})\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".to_owned(),
+                text,
+            }]))
+        };
+        for (clause, encoded) in [("unless", Encoded::WhileClear), ("if", Encoded::WhileSet)] {
+            for (word, parameter, index) in
+                [("whole", "&tensor[1] i32", 0), ("whole[0]", "&tensor[1] i32", 0), ("whole[2]", "&tensor[3] i32", 2)]
+            {
+                for backend in BackendName::ALL {
+                    let checked = check(declaration(clause, word, parameter, backend.as_str()));
+                    if !backend.encodes_runs() {
+                        let error = checked.expect_err("a backend encoding no run refuses a condition");
+                        let expected = format!("{} does not encode each run", backend.as_str());
+                        assert!(error.to_string().contains(&expected), "{clause} on {backend:?}: got {error}");
+                        continue;
+                    }
+                    let module = checked.expect("a one-word condition checks");
+                    let native = module
+                        .native_implementation(module.entries()[0].id, backend)
+                        .expect("native implementation");
+                    assert_eq!(
+                        native.launches[0].conditions,
+                        [LaunchCondition {
+                            word: "whole".to_owned(),
+                            index,
+                            encoded,
+                        }],
+                        "{clause} ({word}) on {backend:?}"
+                    );
+                }
+            }
+            for (word, parameter, expected) in [
+                ("whole", "&tensor[1] f32", "must be a word of a `&tensor[N] i32`"),
+                ("whole", "&mut tensor[1] i32", "must be a word of a `&tensor[N] i32`"),
+                ("whole", "&tensor[1, 1] i32", "must be a word of a `&tensor[N] i32`"),
+                ("whole[1]", "&tensor[1] i32", "`whole[1]` indexes past its `&tensor[1] i32`"),
+                ("whole[3]", "&tensor[3] i32", "`whole[3]` indexes past its `&tensor[3] i32`"),
+                ("whole[0]", "&tensor[N] i32", "of a constant N"),
+            ] {
+                let error = check(declaration(clause, word, parameter, "metal"))
+                    .expect_err("an inadmissible condition must fail checking");
+                assert!(
+                    error.to_string().contains(expected),
+                    "{clause} {word} {parameter}: expected {expected:?}, got {error}"
+                );
+            }
+        }
+        // A conjunction names each word once; distinct words of one tensor
+        // are distinct conditions.
+        for second in ["if", "unless"] {
+            let repeated = declaration("unless", "whole", "&tensor[1] i32", "metal")
+                .replace("unless (whole)\n", &format!("unless (whole)\n        {second} (whole[0])\n"));
+            let error = check(repeated).expect_err("a word named twice must fail checking");
+            assert!(error.to_string().contains("`whole[0]` is named twice"), "{second}: got {error}");
+        }
+        let distinct = declaration("unless", "whole[0]", "&tensor[2] i32", "metal")
+            .replace("unless (whole[0])\n", "unless (whole[0])\n        if (whole[1])\n");
+        let module = check(distinct).expect("distinct words of one tensor check");
+        let native = module.native_implementation(module.entries()[0].id, BackendName::Metal).unwrap();
+        assert_eq!(native.launches[0].conditions.iter().map(|condition| condition.index).collect::<Vec<_>>(), [0, 1]);
+        assert!(Encoded::WhileSet.encodes(1) && !Encoded::WhileSet.encodes(0));
+        assert!(Encoded::WhileClear.encodes(0) && !Encoded::WhileClear.encodes(1));
+    }
+
+    /// A written grid's word gates no launch, its own or another, on any
+    /// backend (`NativeLaunch::grid`).
+    #[test]
+    fn a_written_grids_word_gates_no_launch() {
+        let declaration = |backend: &str, launches: &str| {
+            format!(
+                "fn fill[N](grid: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n{launches}"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".to_owned(),
+                text,
+            }]))
+        };
+        let gridded = "    launch fill:\n        threadgroups (N, 1, 1)\n        grid (grid)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for backend in BackendName::ALL {
+            for launches in [
+                gridded.replace("grid (grid)\n", "grid (grid)\n        if (grid[1])\n"),
+                format!("{gridded}    launch other:\n        threadgroups (1, 1, 1)\n        unless (grid[0])\n        threads_per_threadgroup (1, 1, 1)\n"),
+            ] {
+                let error = check(declaration(backend.as_str(), &launches)).expect_err("a grid word's condition fails");
+                assert!(error.to_string().contains("a written grid's word gates no launch"), "{backend:?}: got {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn equivalent_family_bodies_propagate_renamed_element_bindings() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "repack.seismic".to_owned(),
+            text: "fn repack_weight[N](source: &tensor[N] E) -> tensor[N] U:\n    return repack[U = U](source)\n\nfn repack_weight[N](source: &tensor[N] T) -> tensor[N] V:\n    return repack[U = V](source)\n"
+                .to_owned(),
+        }]))
+        .expect("equivalent generic spellings form one checked family");
+        let entry = module.entry_named("repack_weight").unwrap();
+        let bindings = ElementBindings::new()
+            .bind("E", registry::representation("gguf_q8_0").unwrap())
+            .bind("U", registry::representation("q8g32s").unwrap());
+        let logical = module
+            .entry(entry, &bindings)
+            .expect("every family body inherits the contract element binding");
+        assert_eq!(
+            logical
+                .program()
+                .family(logical.program().root())
+                .candidates()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn equivalent_family_bodies_propagate_renamed_tuple_result_bindings() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "repack_tuple.seismic".to_owned(),
+            text: "fn repack_pair[N](source: &tensor[N] E) -> (tensor[N] U, f32):\n    return (repack[U = U](source), f32(0.0))\n\nfn repack_pair[N](source: &tensor[N] T) -> (tensor[N] V, f32):\n    return (repack[U = V](source), f32(0.0))\n"
+                .to_owned(),
+        }]))
+        .expect("equivalent tuple result generics form one checked family");
+        let entry = module.entry_named("repack_pair").unwrap();
+        let bindings = ElementBindings::new()
+            .bind("E", registry::representation("gguf_q8_0").unwrap())
+            .bind("U", registry::representation("q8g32s").unwrap());
+        let logical = module
+            .entry(entry, &bindings)
+            .expect("tuple result generic binding reaches every family body");
+        assert_eq!(
+            logical
+                .program()
+                .family(logical.program().root())
+                .candidates()
+                .len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    fn rejected(text: &str) -> SourceError {
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "probe.seismic".into(),
+            text: text.into(),
+        }]))
+        .expect_err("the source must be rejected")
+    }
+
+    fn single(error: &SourceError) -> &SourceDiagnostic {
+        let [item] = error.diagnostics().items() else {
+            panic!("expected one diagnostic, got {error}")
+        };
+        item
+    }
+
+    #[test]
+    fn display_renders_location_rule_message_and_caret() {
+        let error = rejected("fn h(x: f32) -> f32 for cpu:\n    return x\n");
+        let item = single(&error);
+        assert_eq!(item.rule, DiagnosticRule::Syntax);
+        assert_eq!((item.location.line, item.location.column), (1, 21));
+        assert_eq!(
+            error.to_string(),
+            "probe.seismic:1:21: Syntax: backend code is written as `lower NAME … for BACKEND`; a `fn` is portable\n  fn h(x: f32) -> f32 for cpu:\n                      ^^^"
+        );
+    }
+
+    #[test]
+    fn diagnostics_drop_every_repeated_item() {
+        let file = SourceFile {
+            path: "probe.seismic".into(),
+            text: "fn f() -> i32:\n    return 0\n".into(),
+        };
+        let item = |end: usize, message: &str| {
+            SourceDiagnostic::new(&file, Span::new(3, end), DiagnosticRule::Type, message)
+        };
+        let diagnostics =
+            Diagnostics::new(vec![item(4, "first"), item(5, "other"), item(4, "first")])
+                .expect("the items are not empty");
+        assert_eq!(diagnostics.items(), &[item(4, "first"), item(5, "other")]);
+    }
+
+    #[test]
+    fn line_column_counts_characters_from_one() {
+        let text = "ab\n→cd\n";
+        assert_eq!(line_column(text, Span::new(0, 1)), (1, 1));
+        assert_eq!(line_column(text, Span::new(3, 4)), (2, 1));
+        assert_eq!(line_column(text, Span::new(6, 7)), (2, 2));
+    }
+
+    #[test]
+    fn a_call_binds_a_dimension_at_most_once() {
+        let error = rejected(
+            "fn fill[N](output: &mut tensor[N] i32):\n    output[0] = 1\n\nfn caller[N](output: &mut tensor[N] i32):\n    fill[N = 3, N = 4](output)\n",
+        );
+        assert!(error.to_string().contains("binds `fill`'s dimension `N` twice"), "{error}");
+    }
+
+    #[test]
+    fn resolution_rules_are_typed() {
+        let recursion = rejected(
+            "fn a[N](x: &tensor[N] i32) -> i32:\n    return b(x)\n\nfn b[N](x: &tensor[N] i32) -> i32:\n    return a(x)\n",
+        );
+        let item = single(&recursion);
+        assert_eq!(item.rule, DiagnosticRule::Recursion);
+        assert!(item.message.contains("`a` -> `b` -> `a`"), "{recursion}");
+
+        let names = rejected(
+            "fn diff(a: i32, b: i32) -> i32:\n    return a - b\n\nfn diff(b: i32, a: i32) -> i32:\n    return a - b\n",
+        );
+        let item = single(&names);
+        assert_eq!(item.rule, DiagnosticRule::CallContract);
+        assert_eq!(item.location.line, 4);
+        assert!(item.message.contains("parameter names differ"), "{names}");
+
+        for builtin in ["max", "index", "range", "f32", "to_owned"] {
+            let error = rejected(&format!("fn {builtin}(a: f32) -> f32:\n    return a\n"));
+            let item = single(&error);
+            assert_eq!(item.rule, DiagnosticRule::Resolution, "{error}");
+            assert!(
+                item.message.contains("names a builtin operation"),
+                "{error}"
+            );
+        }
+        // L20: each recursion is one diagnostic and hides no other definition.
+        let recursions = rejected(
+            "fn a(x: i32) -> i32:\n    return b(x)\n\nfn b(x: i32) -> i32:\n    return a(x)\n\nfn c(x: i32) -> i32:\n    return c(x)\n\nfn d(x: i32) -> i32:\n    return a(x)\n\nfn e(x: i32) -> i32:\n    return x + true\n",
+        );
+        let items = recursions.diagnostics().items();
+        let rules = items.iter().map(|item| item.rule).collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            [
+                DiagnosticRule::Recursion,
+                DiagnosticRule::Recursion,
+                DiagnosticRule::Type
+            ],
+            "{recursions}"
+        );
+        assert!(
+            items[0].message.contains("`a` -> `b` -> `a`"),
+            "{recursions}"
+        );
+        assert!(items[1].message.contains("`c` -> `c`"), "{recursions}");
+
+        // L8: retired spellings are ordinary names.
+        for retired in [
+            "exp_fast", "load", "clone", "decode", "valid", "capacity", "coord",
+        ] {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "probe.seismic".into(),
+                text: format!("fn {retired}(a: f32) -> f32:\n    return a\n"),
+            }]))
+            .unwrap_or_else(|error| panic!("`{retired}` is an ordinary name: {error}"));
+        }
+    }
+
+    #[test]
+    fn retired_keywords_are_ordinary_names() {
+        check_source(SourceSet::new(vec![SourceFile {
+            path: "names.seismic".into(),
+            text:
+                "fn f(x: f32) -> f32:\n    let stage = x\n    let tile = stage\n    return tile\n"
+                    .into(),
+        }]))
+        .expect("retired keywords are ordinary names");
+    }
+
+    #[test]
+    fn element_uses_admit_by_representation() {
+        let dense = registry::dense;
+        let q4g64 = registry::representation("q4g64").unwrap();
+        let external = registry::representation("gguf_q4_k").unwrap();
+        let stored = ElementUses {
+            stored: true,
+            ..ElementUses::default()
+        };
+        let read = ElementUses {
+            decoded_read: true,
+            ..ElementUses::default()
+        };
+        let copied = ElementUses {
+            decoded_read: true,
+            partial_copy: true,
+            ..ElementUses::default()
+        };
+        let component = ElementUses {
+            component_read: true,
+            integer_code_read: true,
+            ..ElementUses::default()
+        };
+        assert!(component.admits(registry::representation("q4g32s").unwrap()));
+        assert!(!component.admits(dense(DType::F32)));
+        assert!(!component.admits(external));
+        assert!(stored.admits(dense(DType::BF16)));
+        assert!(!stored.admits(q4g64));
+        assert!(!stored.admits(dense(DType::I32)));
+        assert!(read.admits(q4g64));
+        assert!(!read.admits(external));
+        assert!(!copied.admits(q4g64));
+        assert!(ElementUses::default().admits(external));
+        assert!(!ElementUses::default().admits(dense(DType::Bool)));
+    }
+
+    #[test]
+    fn element_domain_admits_exactly_its_bindings() {
+        let external = registry::representation("gguf_q4_k").unwrap();
+        let q4k = registry::representation("q4k").unwrap();
+        let domain = ElementDomain::new(
+            vec![
+                ElementParameter {
+                    name: "T".into(),
+                    uses: ElementUses {
+                        conversion_source: true,
+                        ..ElementUses::default()
+                    },
+                },
+                ElementParameter {
+                    name: "U".into(),
+                    uses: ElementUses {
+                        stored: true,
+                        ..ElementUses::default()
+                    },
+                },
+            ],
+            vec![ElementConversion {
+                source: "T".into(),
+                target: ElementTarget::Concrete(q4k),
+            }],
+            Vec::new(),
+        );
+        let f32 = registry::dense(DType::F32);
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", external).bind("U", f32)),
+            Ok(())
+        );
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", external)),
+            Err(ElementBindingError::Missing {
+                parameter: "U".into()
+            })
+        );
+        assert_eq!(
+            domain.admit(
+                &ElementBindings::new()
+                    .bind("T", external)
+                    .bind("U", f32)
+                    .bind("V", f32)
+            ),
+            Err(ElementBindingError::Unexpected {
+                parameter: "V".into()
+            })
+        );
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", external).bind("U", q4k)),
+            Err(ElementBindingError::Inadmissible {
+                parameter: "U".into(),
+                representation: q4k,
+                uses: ElementUses {
+                    stored: true,
+                    ..ElementUses::default()
+                },
+            })
+        );
+        assert_eq!(
+            domain.admit(&ElementBindings::new().bind("T", f32).bind("U", f32)),
+            Err(ElementBindingError::NoConversion {
+                source: f32,
+                target: q4k
+            })
+        );
+    }
+
+    #[test]
+    fn element_predicates_decide_the_bound_operand_recipes() {
+        let parameter = |name: &str| ElementParameter {
+            name: name.into(),
+            uses: ElementUses {
+                decoded_read: true,
+                ..ElementUses::default()
+            },
+        };
+        let operands = |name: &str| ElementTerm::Operands(name.into());
+        let shared = ElementPredicate {
+            equal: true,
+            left: operands("Q"),
+            right: operands("K"),
+        };
+        let rounded = ElementPredicate {
+            equal: true,
+            left: operands("R"),
+            right: ElementTerm::Constant(0),
+        };
+        let domain = ElementDomain::new(
+            vec![parameter("Q"), parameter("K"), parameter("R")],
+            Vec::new(),
+            vec![shared.clone(), rounded.clone()],
+        );
+        assert!(domain.well_formed());
+        let w4a16 = registry::representation("nvfp4g16").unwrap();
+        let w4a4 = registry::representation("nvfp4g16a4").unwrap();
+        let bf16 = registry::dense(DType::BF16);
+        let bind = |q, k, r| ElementBindings::new().bind("Q", q).bind("K", k).bind("R", r);
+        assert_eq!(domain.admit(&bind(w4a4, w4a4, w4a16)), Ok(()));
+        assert_eq!(domain.admit(&bind(w4a16, bf16, bf16)), Ok(()));
+        assert_eq!(
+            domain.admit(&bind(w4a4, bf16, bf16)),
+            Err(ElementBindingError::Excluded { predicate: shared })
+        );
+        assert_eq!(
+            domain.admit(&bind(bf16, bf16, w4a4)),
+            Err(ElementBindingError::Excluded { predicate: rounded })
+        );
+    }
+}

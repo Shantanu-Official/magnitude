@@ -1,0 +1,157 @@
+name: Release upload diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        default: recovery
+        options: [comparison, recovery, curl, exact-archive]
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    if: inputs.mode == 'comparison'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [blacksmith-4vcpu-ubuntu-2204, ubuntu-22.04]
+        client: [bun, gh]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      UPLOAD_CLIENT: ${{ matrix.client }}
+      DIAGNOSTIC_TAG: upload-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}-${{ matrix.client }}
+    steps:
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - name: Compare sequential binary uploads to a disposable draft
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh --version
+          bun --version
+          gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary upload diagnostic' --notes 'Disposable CI transport comparison; never published.'
+          trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
+          release_id=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
+          upload_url=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .upload_url)
+          export UPLOAD_URL="${upload_url%%\{*}"
+          dd if=/dev/urandom of=payload.bin bs=1M count=32 status=none
+          for attempt in 1 2 3; do
+            export ASSET_NAME="payload-$attempt.bin"
+            echo "Starting $UPLOAD_CLIENT upload $attempt at $(date -u +%FT%TZ)"
+            if [ "$UPLOAD_CLIENT" = gh ]; then
+              cp payload.bin "$ASSET_NAME"
+              time timeout 150 gh release upload "$DIAGNOSTIC_TAG" "$ASSET_NAME"
+            else
+              bun -e '
+                const started = performance.now();
+                const response = await fetch(`${process.env.UPLOAD_URL}?name=${process.env.ASSET_NAME}`, {
+                  method: "POST",
+                  headers: { authorization: `Bearer ${process.env.GH_TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "content-type": "application/octet-stream" },
+                  body: Bun.file("payload.bin"),
+                  signal: AbortSignal.timeout(150_000),
+                });
+                const body = await response.text();
+                console.log(JSON.stringify({ status: response.status, elapsedMs: Math.round(performance.now() - started), requestId: response.headers.get("x-github-request-id"), retryAfter: response.headers.get("retry-after"), body }));
+                if (!response.ok) process.exit(1);
+              '
+            fi
+            sleep 1
+          done
+  recovery:
+    if: inputs.mode == 'recovery'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ github.sha }}
+      DIAGNOSTIC_TAG: upload-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - name: Verify uploads and a no-op resume against GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary upload recovery validation' --notes 'Disposable validation; never published.'
+          trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
+          export RELEASE_ID=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
+          dd if=/dev/urandom of=small.bin bs=1M count=32 status=none
+          dd if=/dev/urandom of=large.bin bs=1M count=640 status=none
+          bun -e '
+            import { Effect } from "effect";
+            import { createHash } from "node:crypto";
+            import { CurlReleaseUploadTransport, uploadReleaseAssets } from "./packages/release/scripts/github-upload";
+            const files = [];
+            for (const name of ["small.bin", "large.bin"]) {
+              const hash = createHash("sha256");
+              for await (const chunk of Bun.file(name).stream()) hash.update(chunk);
+              files.push({name, path:name, bytes:Bun.file(name).size, sha256:hash.digest("hex")});
+            }
+            const options = { repository:process.env.GH_REPO, token:process.env.GH_TOKEN, releaseId:Number(process.env.RELEASE_ID), tag:process.env.DIAGNOSTIC_TAG, sourceCommit:process.env.SOURCE_COMMIT, uploadUrl:`https://uploads.github.com/repos/${process.env.GH_REPO}/releases/${process.env.RELEASE_ID}/assets`, files };
+            const list = async () => {
+              const response = await fetch(`https://api.github.com/repos/${options.repository}/releases/${options.releaseId}/assets`, {headers:{authorization:`Bearer ${options.token}`}});
+              if (!response.ok) throw new Error(`asset lookup: ${response.status}`);
+              return await response.json();
+            };
+            await Effect.runPromise(uploadReleaseAssets(options).pipe(Effect.provide(CurlReleaseUploadTransport)));
+            const before = await list();
+            for (const file of files) {
+              const asset = before.find(asset => asset.name === file.name);
+              if (asset?.state !== "uploaded" || asset.size !== file.bytes || asset.digest !== `sha256:${file.sha256}`) throw new Error(`unverified upload: ${file.name}`);
+            }
+            await Effect.runPromise(uploadReleaseAssets(options).pipe(Effect.provide(CurlReleaseUploadTransport)));
+            const after = await list();
+            if (JSON.stringify(before.map(a=>a.id).sort()) !== JSON.stringify(after.map(a=>a.id).sort())) throw new Error("Resume replaced verified assets");
+            console.log("Verified real upload digests and preserved asset IDs on resume");
+          '
+  curl:
+    if: inputs.mode == 'curl' || inputs.mode == 'exact-archive'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ github.sha }}
+      DIAGNOSTIC_TAG: upload-curl-${{ github.run_id }}-${{ github.run_attempt }}
+      PROBE_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Probe a fresh HTTP connection with transfer metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$DIAGNOSTIC_TAG" --draft --target "$SOURCE_COMMIT" --title 'Temporary curl upload probe' --notes 'Disposable validation; never published.'
+          trap 'gh release delete "$DIAGNOSTIC_TAG" --yes' EXIT
+          release_id=$(gh release view "$DIAGNOSTIC_TAG" --json databaseId --jq .databaseId)
+          upload_url=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .upload_url)
+          upload_url="${upload_url%%\{*}"
+          if [ "$PROBE_MODE" = exact-archive ]; then
+            curl --fail --location --silent --show-error --connect-timeout 15 --max-time 180 \
+              'https://github.com/magnitudedev/magnitude/releases/download/%40magnitudedev/cli%400.1.0-alpha.0/magnitude-icn-cuda-12.9-linux-arm64-gnu.tar.gz' -o payload.bin
+            echo 'b86f49fe8044addd56b64472785267b7cbc6b0e58aec2e45b52107620c375a78  payload.bin' | sha256sum --check
+          else
+            dd if=/dev/urandom of=payload.bin bs=1M count=128 status=none
+          fi
+          echo "Uploading $(stat -c%s payload.bin) bytes with curl; 30-second low-speed cutoff, 180-second total deadline"
+          curl --http1.1 --fail-with-body --show-error --connect-timeout 15 --max-time 180 \
+            --speed-time 30 --speed-limit 1024 \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' \
+            -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H 'Connection: close' \
+            --data-binary @payload.bin --output response.json --dump-header response.headers \
+            --write-out 'status=%{http_code} bytes_sent=%{size_upload} speed=%{speed_upload} connect=%{time_connect} tls=%{time_appconnect} first_byte=%{time_starttransfer} total=%{time_total}\n' \
+            "$upload_url?name=payload.bin" || { cat response.headers; cat response.json; exit 1; }
+          cat response.headers
+          jq '{id,name,size,state,digest}' response.json

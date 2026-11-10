@@ -1,0 +1,49 @@
+{
+  "name": "@magnitudedev/cli",
+  "private": true,
+  "version": "0.2.17",
+  "description": "Command-line launcher for the installed Magnitude desktop app",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/magnitudedev/magnitude.git",
+    "directory": "packages/launcher"
+  },
+  "homepage": "https://github.com/magnitudedev/magnitude",
+  "bugs": {
+    "url": "https://github.com/magnitudedev/magnitude/issues"
+  },
+  "keywords": [
+    "ai",
+    "inference",
+    "local-models",
+    "cli",
+    "magnitude"
+  ],
+  "author": {
+    "name": "Magnitude",
+    "email": "founders@magnitude.dev",
+    "url": "https://magnitude.dev"
+  },
+  "contributors": [
+    "Anders Lie <anders@magnitude.dev>",
+    "Tom Greenwald <tom@magnitude.dev>"
+  ],
+  "bin": {
+    "magnitude": "bin/magnitude.js"
+  },
+  "files": [
+    "bin/magnitude.js"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "prepack": "bun run scripts/build-launcher.ts"
+  },
+  "devDependencies": {
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-node": "0.107.0",
+    "@magnitudedev/utils": "workspace:*",
+    "@types/bun": "1.3.14",
+    "effect": "^3.21.2"
+  }
+}

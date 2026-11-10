@@ -1,0 +1,19 @@
+//! Family-neutral request scheduling and execution ownership.
+//!
+//! The crate observes logical generation work, byte-denominated capacity, and
+//! completion events. Model-family execution and protocol publication remain
+//! in composition crates above this boundary.
+
+pub mod domain;
+pub mod owner;
+pub mod policy;
+pub mod prefix_cache;
+pub mod protocol;
+pub mod publication;
+mod release;
+pub mod round_driver;
+pub mod serving;
+pub mod worker;
+pub use magnitude_executor::workload;
+
+pub use policy::ServiceLimits;

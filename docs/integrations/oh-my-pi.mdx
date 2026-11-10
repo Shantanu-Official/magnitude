@@ -1,0 +1,56 @@
+---
+title: "Oh My Pi"
+description: "Connect Oh My Pi to your downloaded Magnitude models."
+---
+
+## Connect
+
+1. [Install Oh My Pi](https://github.com/can1357/oh-my-pi#installation) if needed.
+2. Download a compatible model in Magnitude.
+3. Open **Connections → Oh My Pi** and click **Connect**.
+4. Select a downloaded model on the connected card, then click the command to copy it.
+5. Paste it into your terminal from your project folder. On Windows, use PowerShell.
+
+Restart Oh My Pi and choose a Magnitude model. If you use named profiles, connect the profile you actually run: check the paths shown in Connections rather than editing a different profile.
+
+## Run Oh My Pi
+
+After connecting in Magnitude, start Oh My Pi with:
+
+```sh
+omp --model magnitude/MODEL_ID
+```
+
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+
+## Configuration
+
+**Connect** writes `~/.omp/agent/models.yml` and `~/.omp/agent/config.yml`. Location overrides: `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, and `PI_CODING_AGENT_DIR`.
+
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Oh My Pi and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
+
+`~/.omp/agent/models.yml`:
+
+```yaml
+providers:
+  magnitude:
+    baseUrl: http://ADDRESS:10100/inference/v1
+    apiKey: API_KEY
+    api: openai-completions
+    models:
+      - id: MODEL_ID
+        name: MODEL_ID
+        reasoning: false
+        input: [text]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 32768
+        maxTokens: 8192
+```

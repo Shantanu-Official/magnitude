@@ -1,0 +1,156 @@
+import { defineConfig } from "electron-vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { isBuiltin } from "node:module";
+import type { Plugin } from "vite";
+import { Option, Schema } from "effect";
+import {
+  DESKTOP_DISTRIBUTION_VARIABLE,
+  DesktopDistributionJson,
+  developmentDesktopDistribution,
+} from "../packages/release/src/desktop-distribution";
+
+if (process.versions.bun) {
+  throw new Error("Build Electron with Node.js installed on PATH; Bun's built-in modules differ from Electron's.");
+}
+
+// The installed app contains bundled JavaScript, not a repository node_modules tree.
+const bundledRuntime = (): Plugin => ({
+  name: "bundled-desktop-runtime",
+  generateBundle(_options, bundle) {
+    for (const output of Object.values(bundle)) {
+      if (output.type !== "chunk") continue;
+      for (const dependency of [...output.imports, ...output.dynamicImports]) {
+        if (dependency !== "electron" && !isBuiltin(dependency) && !bundle[dependency]) {
+          this.error(`Desktop runtime dependency was not bundled: ${dependency}`);
+        }
+      }
+    }
+  },
+});
+
+const acceptanceConfig = process.env.MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG;
+// Publisher identities are resolved by the release build for its host, never from signing variables.
+const encodedDistribution = process.env[DESKTOP_DISTRIBUTION_VARIABLE];
+const distribution = encodedDistribution === undefined
+  ? developmentDesktopDistribution
+  : Schema.decodeUnknownSync(DesktopDistributionJson)(encodedDistribution);
+const updateConfiguration = acceptanceConfig ? {
+  ...JSON.parse(readFileSync(acceptanceConfig, "utf8")), acceptance: true,
+} : {
+  origin: "https://magnitude.dev",
+  keyId: "magnitude-2026-01",
+  publicKey: readFileSync(resolve(__dirname, "../packages/release/resources/distribution/magnitude-2026-01.pub.pem"), "utf8"),
+  acceptance: false,
+  ...Option.match(distribution.windowsPublisher, { onNone: () => ({}), onSome: (windowsPublisher) => ({ windowsPublisher }) }),
+};
+
+export default defineConfig({
+  main: {
+    define: {
+      // Keep ws on its portable implementations; optional native addons are not shipped.
+      "process.env.WS_NO_BUFFER_UTIL": "true",
+      "process.env.WS_NO_UTF_8_VALIDATE": "true",
+      __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
+      __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
+      MAGNITUDE_APPLE_TEAM_ID: JSON.stringify(Option.getOrElse(distribution.appleTeam, () => "")),
+    },
+    plugins: [bundledRuntime(), { name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
+      name: "installed-update-trust",
+      generateBundle() {
+        this.emitFile({ type: "asset", fileName: "update-configuration.json", source: JSON.stringify(updateConfiguration) });
+        this.emitFile({ type: "asset", fileName: "update-trust.json", source: JSON.stringify({ keyId: updateConfiguration.keyId, publicKey: updateConfiguration.publicKey }) });
+      },
+    }],
+    build: {
+      // Workspace packages publish TypeScript source for Bun. Bundle them for
+      // Electron's Node runtime so production does not depend on repository
+      // source files or Node's TypeScript resolution behavior.
+      externalizeDeps: false,
+      rollupOptions: {
+        input: {
+          main: resolve(__dirname, "src/main.ts"),
+        },
+      },
+    },
+  },
+  preload: {
+    plugins: [bundledRuntime()],
+    build: {
+      externalizeDeps: false,
+      rollupOptions: {
+        input: {
+          preload: resolve(__dirname, "src/preload.ts"),
+          "server-conflict-preload": resolve(__dirname, "src/server-conflict-preload.ts"),
+        },
+      },
+    },
+  },
+  renderer: {
+    root: ".",
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, "index.html"),
+          "server-conflict": resolve(__dirname, "server-conflict.html"),
+        },
+      },
+    },
+    resolve: {
+      alias: [
+        {
+          find: "@",
+          replacement: resolve(__dirname, "../web/src"),
+        },
+        {
+          find: /^@magnitudedev\/sdk$/,
+          replacement: resolve(__dirname, "../packages/sdk/src/index.ts"),
+        },
+        {
+          find: /^@magnitudedev\/web\/(.*)$/,
+          replacement: resolve(__dirname, "../web/src/$1"),
+        },
+      ],
+    },
+    server: {
+      fs: {
+        allow: [resolve(__dirname, "..")],
+      },
+    },
+    plugins: [react(), tailwindcss()],
+    define: {
+      "process.platform": JSON.stringify("browser"),
+      "process.arch": JSON.stringify("browser"),
+      "process.pid": "0",
+      "process.env": "{}",
+      "process.versions": "{}",
+    },
+    optimizeDeps: {
+      // Workspace packages are served as source, so the startup scan reads them too; otherwise their
+      // dependencies are found mid-load and the re-optimization leaves the first window blank.
+      entries: [
+        "index.html",
+        "server-conflict.html",
+        "../web/src/**/*.{ts,tsx}",
+        "../packages/{client-common,sdk,acn-protocol,effect-query,utils,generate-id}/src/**/*.{ts,tsx}",
+        "!**/*.test.{ts,tsx}",
+        "!**/fixtures/**",
+      ],
+      exclude: [
+        "@magnitudedev/sdk",
+          "@magnitudedev/sdk/desktop-host",
+          "@magnitudedev/daemon-management",
+          "@magnitudedev/daemon-management/desktop-native",
+          "@magnitudedev/utils",
+          "@magnitudedev/harness-connections",
+          "@magnitudedev/storage/sqlite/node",
+          "@magnitudedev/storage",
+          "@magnitudedev/release",
+        "@magnitudedev/client-common",
+        "@magnitudedev/generate-id",
+      ],
+    },
+  },
+});

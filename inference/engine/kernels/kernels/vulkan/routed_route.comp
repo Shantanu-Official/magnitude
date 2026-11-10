@@ -1,0 +1,5 @@
+#include "lib/routed/route.glsl"
+void routed_route_gemv() { route_gemv(); }
+void routed_route_select() { route_select(); }
+void routed_route_stage() { route_stage(); }
+void routed_route_gemm() { route_gemm(); }

@@ -1,0 +1,65 @@
+import { Cause, Context, Duration, Effect, Layer, Stream } from "effect"
+import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
+import { IcnClient, type IcnClientService } from "../client.js"
+import { HardwareSnapshot as HardwareSnapshotSchema } from "@magnitudedev/icn-protocol/schemas"
+import {
+  makeIcnObservedState,
+  type IcnObservedState,
+} from "../observed-state.js"
+import { IcnEvents, refreshOnIcnEvents } from "../events/index.js"
+
+type HardwareReadError = Effect.Effect.Error<ReturnType<IcnClientService["system"]["getHardware"]>>
+
+export interface IcnHardwareService extends IcnObservedState<HardwareSnapshotSchema, HardwareReadError> {
+}
+
+export class IcnHardware extends Context.Tag("@magnitudedev/icn/IcnHardware")<
+  IcnHardware,
+  IcnHardwareService
+>() {}
+
+export interface IcnHardwareOptions {
+  readonly refreshInterval?: Duration.DurationInput
+}
+
+export const makeIcnHardware = (
+  options: IcnHardwareOptions = {},
+): Layer.Layer<IcnHardware, HardwareReadError, IcnClient | IcnEvents> =>
+  Layer.scoped(
+    IcnHardware,
+    Effect.gen(function* () {
+      const client = yield* IcnClient
+      const events = yield* IcnEvents
+      const invalidations = yield* events.subscribe
+      const read = client.system.getHardware({})
+      const initial = yield* read
+      const observed = yield* makeIcnObservedState(
+        initial,
+        read,
+        dataEquivalence(),
+        { initiallyInitialized: true },
+      )
+
+      // Instance transitions alter the allocatable-memory view immediately.
+      // Polling remains necessary for memory consumed by unrelated processes.
+      yield* refreshOnIcnEvents(
+        invalidations,
+        new Set(["hardware"]),
+        observed.refresh,
+        "ICN hardware snapshot",
+        options.refreshInterval ?? "2 seconds",
+      ).pipe(Effect.forkScoped)
+
+      yield* observed.refresh.pipe(
+        Effect.tapError((error) => Effect.logWarning("Unable to refresh ICN hardware snapshot").pipe(
+          Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(error)) }),
+        )),
+        Effect.option,
+        Effect.delay(options.refreshInterval ?? "2 seconds"),
+        Effect.forever,
+        Effect.forkScoped,
+      )
+
+      return IcnHardware.of(observed)
+    }),
+  )

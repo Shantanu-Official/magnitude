@@ -1,0 +1,29 @@
+{
+  "name": "@magnitudedev/cli-source",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run ../packages/version/scripts/generate-version.ts --dev && bun run src/index.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "bunx --bun vitest run"
+  },
+  "dependencies": {
+    "@commander-js/extra-typings": "^14.0.0",
+    "@magnitudedev/sdk": "workspace:*",
+    "@magnitudedev/client-common": "workspace:*",
+    "@magnitudedev/release": "workspace:*",
+    "@magnitudedev/version": "workspace:*",
+    "@effect/platform": "^0.96.0",
+    "@effect/platform-bun": "^0.90.0",
+    "commander": "^14.0.1",
+    "effect": "^3.21.2",
+    "string-width": "^8.1.1",
+    "@magnitudedev/daemon-management": "workspace:*",
+    "@magnitudedev/harness-connections": "workspace:*",
+    "@magnitudedev/storage": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
